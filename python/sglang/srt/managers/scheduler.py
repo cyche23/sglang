@@ -151,6 +151,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -266,6 +267,10 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_unified_radix_cache = server_args.enable_unified_radix_cache
+        self.enable_cache_load_back = (
+            self.enable_hierarchical_cache or self.enable_unified_radix_cache
+        )
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
 
@@ -438,7 +443,7 @@ class Scheduler(
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
-            self.enable_hierarchical_cache,
+            self.enable_cache_load_back,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
@@ -730,7 +735,20 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+            if server_args.enable_unified_radix_cache:
+                self.tree_cache = UnifiedRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    l3_dir=server_args.unified_radix_cache_l3_dir,
+                    l3_budget_gb=server_args.unified_radix_cache_l3_budget_gb,
+                    l3_block_size=server_args.unified_radix_cache_l3_block_size,
+                    eviction_policy=server_args.radix_eviction_policy,
+                    offload_after_finish_min_tokens=server_args.unified_radix_cache_offload_after_finish_min_tokens,
+                    is_eagle=self.spec_algorithm.is_eagle(),
+                    tp_rank=self.tp_rank,
+                )
+            elif os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
@@ -1676,7 +1694,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
+        if self.enable_cache_load_back:
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
@@ -1743,7 +1761,7 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if self.enable_cache_load_back:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
@@ -1800,7 +1818,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
-        if self.enable_hierarchical_cache:
+        if self.enable_cache_load_back:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()

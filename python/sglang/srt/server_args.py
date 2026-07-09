@@ -391,6 +391,11 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    enable_unified_radix_cache: bool = False
+    unified_radix_cache_l3_dir: str = "/tmp/sglang-unified-radix-l3"
+    unified_radix_cache_l3_budget_gb: float = 1.0
+    unified_radix_cache_l3_block_size: int = 4096
+    unified_radix_cache_offload_after_finish_min_tokens: int = 0
     # LMCache
     enable_lmcache: bool = False
 
@@ -1496,6 +1501,32 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if self.enable_unified_radix_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-radix-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time."
+            )
+        if self.enable_unified_radix_cache and self.enable_hierarchical_cache:
+            raise ValueError(
+                "The arguments enable-unified-radix-cache and enable-hierarchical-cache are mutually exclusive."
+            )
+        if self.enable_unified_radix_cache and self.enable_lmcache:
+            raise ValueError(
+                "The arguments enable-unified-radix-cache and enable-lmcache are mutually exclusive."
+            )
+        if self.enable_unified_radix_cache:
+            if self.unified_radix_cache_l3_budget_gb <= 0:
+                raise ValueError(
+                    "--unified-radix-cache-l3-budget-gb must be greater than 0."
+                )
+            if self.unified_radix_cache_l3_block_size <= 0:
+                raise ValueError(
+                    "--unified-radix-cache-l3-block-size must be greater than 0 bytes."
+                )
+            if self.unified_radix_cache_offload_after_finish_min_tokens < 0:
+                raise ValueError(
+                    "--unified-radix-cache-offload-after-finish-min-tokens must be >= 0."
+                )
 
         if (
             self.disaggregation_decode_enable_offload_kvcache
@@ -2734,6 +2765,35 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--enable-unified-radix-cache",
+            action="store_true",
+            help="Enable the experimental UnifiedRadixCache baseline for Jetson-style unified DRAM plus L3 SSD KV cache.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-l3-dir",
+            type=str,
+            default=ServerArgs.unified_radix_cache_l3_dir,
+            help="Directory for UnifiedRadixCache L3 SSD raw KV files. Each server run uses a process-specific subdirectory.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-l3-budget-gb",
+            type=float,
+            default=ServerArgs.unified_radix_cache_l3_budget_gb,
+            help="UnifiedRadixCache L3 SSD budget in GiB. Internally converted to bytes and enforced with LRU eviction.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-l3-block-size",
+            type=int,
+            default=ServerArgs.unified_radix_cache_l3_block_size,
+            help="UnifiedRadixCache L3 file alignment block size in bytes.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-offload-after-finish-min-tokens",
+            type=int,
+            default=ServerArgs.unified_radix_cache_offload_after_finish_min_tokens,
+            help="Default 0 disables explicit demo offload. When >0, finished requests with at least this many page-aligned tokens are synchronously offloaded to L3.",
         )
         # LMCache
         parser.add_argument(
