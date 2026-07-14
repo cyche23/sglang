@@ -170,7 +170,7 @@ class UnifiedRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
-        value, last_node, partial_l3_miss = self._match_prefix_helper_l3(
+        value, last_node, l3_miss_reason = self._match_prefix_helper_l3(
             self.root_node, key
         )
         if value:
@@ -202,10 +202,10 @@ class UnifiedRadixCache(RadixCache):
         else:
             self.stats.miss_count += 1
             logger.info(
-                "UnifiedRadixCache L3 miss: last_node_id=%s, partial_l3_miss=%s, "
+                "UnifiedRadixCache L3 miss: last_node_id=%s, reason=%s, "
                 "used_bytes=%d, hits=%d, misses=%d",
                 last_node.id,
-                partial_l3_miss,
+                l3_miss_reason,
                 self.stats.used_bytes,
                 self.stats.hit_count,
                 self.stats.miss_count,
@@ -237,10 +237,21 @@ class UnifiedRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
 
             if prefix_len < len(child.key) and child.evicted:
-                # Partial L3 hits are intentionally treated as misses in v1.
-                # Drop the stale SSD subtree and insert recomputed KV below node.
-                self._drop_subtree(child, reason="partial-l3-insert-miss")
-                break
+                split_node, split_status = self._split_evicted_l3_node(
+                    child, prefix_len, reason="insert"
+                )
+                if split_node is None:
+                    if split_status in ("read-failure", "missing-entry"):
+                        break
+                    self._free_uninserted_value(value)
+                    logger.info(
+                        "UnifiedRadixCache insert skipped after partial L3 split "
+                        "failure: node_id=%s, status=%s, preserved_subtree=True",
+                        child.id,
+                        split_status,
+                    )
+                    return total_prefix_length
+                child = split_node
 
             node = child
             if prefix_len == len(node.key):
@@ -423,7 +434,7 @@ class UnifiedRadixCache(RadixCache):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
-        partial_l3_miss = False
+        l3_miss_reason = "no-l3-prefix"
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -431,7 +442,14 @@ class UnifiedRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 if child.evicted:
-                    partial_l3_miss = self._has_l3_entry(child)
+                    split_node, split_status = self._split_evicted_l3_node(
+                        child, prefix_len, reason="match"
+                    )
+                    if split_node is not None:
+                        node = split_node
+                        l3_miss_reason = "partial-l3-split"
+                    else:
+                        l3_miss_reason = f"partial-l3-{split_status}"
                     break
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -445,16 +463,150 @@ class UnifiedRadixCache(RadixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        return value, node, partial_l3_miss
+        return value, node, l3_miss_reason
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         if child.evicted:
-            raise RuntimeError(
-                "UnifiedRadixCache v1 does not split evicted L3 nodes; "
-                "partial L3 matches must fall back to recompute."
+            split_node, split_status = self._split_evicted_l3_node(
+                child, split_len, reason="direct"
             )
+            if split_node is None:
+                raise RuntimeError(
+                    "UnifiedRadixCache failed to split evicted L3 node: "
+                    f"node_id={child.id}, status={split_status}"
+                )
+            return split_node
         self._delete_l3_entry(child)
         return super()._split_node(key, child, split_len)
+
+    def _split_evicted_l3_node(
+        self, child: TreeNode, split_len: int, reason: str
+    ) -> tuple[Optional[TreeNode], str]:
+        if not child.evicted:
+            return child, "not-evicted"
+        if split_len <= 0 or split_len >= len(child.key):
+            return None, "invalid-split"
+
+        old_entry = self._get_l3_entry(child)
+        if old_entry is None:
+            logger.warning(
+                "UnifiedRadixCache partial L3 split found evicted node without "
+                "L3 entry; dropping unrecoverable subtree: node_id=%s, reason=%s",
+                child.id,
+                reason,
+            )
+            self._drop_subtree(child, reason="missing-l3-entry")
+            return None, "missing-entry"
+
+        try:
+            old_kv_cpu = self._read_l3_entry(old_entry)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            logger.warning(
+                "UnifiedRadixCache partial L3 split read failed; dropping stale "
+                "subtree and falling back to recompute: node_id=%s, error=%s",
+                child.id,
+                exc,
+            )
+            self._drop_subtree(child, reason="stale-l3-split-read-failure")
+            return None, "read-failure"
+
+        try:
+            prefix_kv_cpu = self._slice_kv_cpu(old_kv_cpu, 0, split_len)
+            tail_kv_cpu = self._slice_kv_cpu(old_kv_cpu, split_len, len(child.key))
+        except RuntimeError as exc:
+            logger.warning(
+                "UnifiedRadixCache partial L3 split found malformed entry; "
+                "dropping stale subtree and falling back to recompute: "
+                "node_id=%s, error=%s",
+                child.id,
+                exc,
+            )
+            self._drop_subtree(child, reason="stale-l3-split-malformed-entry")
+            return None, "read-failure"
+
+        old_key = child.key
+        parent = child.parent
+        new_node = TreeNode()
+        new_node.parent = parent
+        new_node.lock_ref = child.lock_ref
+        new_node.key = old_key[:split_len]
+        new_node.value = None
+
+        prefix_tmp = self.l3_run_dir / f"node-{new_node.id}.split-{child.id}.tmp"
+        tail_tmp = self.l3_run_dir / f"node-{child.id}.split-{new_node.id}.tmp"
+        prefix_final = self.l3_run_dir / f"node-{new_node.id}.bin"
+        tail_final = self.l3_run_dir / f"node-{child.id}-split-{new_node.id}.bin"
+
+        prefix_entry = self._write_l3_entry_from_cpu(
+            new_node,
+            prefix_kv_cpu,
+            reason="partial-l3-split-prefix",
+            file_path=prefix_tmp,
+            register=False,
+        )
+        if prefix_entry is None:
+            self._remove_file_quietly(prefix_tmp)
+            return None, "write-failure"
+
+        tail_entry = self._write_l3_entry_from_cpu(
+            child,
+            tail_kv_cpu,
+            reason="partial-l3-split-tail",
+            file_path=tail_tmp,
+            register=False,
+        )
+        if tail_entry is None:
+            self._remove_file_quietly(prefix_tmp)
+            self._remove_file_quietly(tail_tmp)
+            return None, "write-failure"
+
+        try:
+            os.replace(prefix_tmp, prefix_final)
+            os.replace(tail_tmp, tail_final)
+        except OSError as exc:
+            logger.warning(
+                "UnifiedRadixCache partial L3 split commit failed; preserving old "
+                "entry: node_id=%s, error=%s",
+                child.id,
+                exc,
+            )
+            self._remove_file_quietly(prefix_tmp)
+            self._remove_file_quietly(tail_tmp)
+            self._remove_file_quietly(prefix_final)
+            self._remove_file_quietly(tail_final)
+            return None, "commit-failure"
+
+        prefix_entry.file_path = str(prefix_final)
+        tail_entry.file_path = str(tail_final)
+
+        self._record_remove_event(child)
+        self._delete_l3_entry(child)
+
+        new_node.children = {self.get_child_key_fn(old_key[split_len:]): child}
+        child.parent = new_node
+        child.key = old_key[split_len:]
+        child.value = None
+        parent.children[self.get_child_key_fn(old_key)] = new_node
+
+        self._register_l3_entry(new_node, prefix_entry, reason="partial-l3-split")
+        self._register_l3_entry(child, tail_entry, reason="partial-l3-split")
+        self._record_store_event(new_node)
+        self._record_store_event(child)
+
+        logger.info(
+            "UnifiedRadixCache partial-l3-split: old_node_id=%s, "
+            "prefix_node_id=%s, tail_node_id=%s, split_tokens=%d, "
+            "tail_tokens=%d, child_count=%d, reason=%s, used_bytes=%d",
+            old_entry.node_id,
+            new_node.id,
+            child.id,
+            split_len,
+            len(child.key),
+            len(child.children),
+            reason,
+            self.stats.used_bytes,
+        )
+        return new_node, "success"
 
     def _offload_exact_prefix(self, token_ids: List[int], extra_key: Optional[str]):
         if not token_ids:
@@ -506,7 +658,7 @@ class UnifiedRadixCache(RadixCache):
         if node.value is None:
             return None
         kv_cpu = self.token_to_kv_pool_allocator.get_cpu_copy(node.value)
-        segments, raw_nbytes, aligned_nbytes = self._build_segments(kv_cpu)
+        segments, raw_nbytes, _ = self._build_segments(kv_cpu)
         if raw_nbytes > self.l3_budget_bytes:
             logger.warning(
                 "UnifiedRadixCache L3 write skipped: entry_bytes=%d exceeds "
@@ -519,8 +671,29 @@ class UnifiedRadixCache(RadixCache):
 
         self._ensure_l3_budget(raw_nbytes, protected_node_id=node.id)
         self._delete_l3_entry(node)
+        return self._write_l3_entry_from_cpu(node, kv_cpu, reason=reason)
 
-        file_path = self.l3_run_dir / f"node-{node.id}.bin"
+    def _write_l3_entry_from_cpu(
+        self,
+        node: TreeNode,
+        kv_cpu,
+        reason: str,
+        file_path: Optional[Path] = None,
+        register: bool = True,
+    ) -> Optional[L3Entry]:
+        segments, raw_nbytes, aligned_nbytes = self._build_segments(kv_cpu)
+        if raw_nbytes > self.l3_budget_bytes:
+            logger.warning(
+                "UnifiedRadixCache L3 write skipped: entry_bytes=%d exceeds "
+                "l3_budget_bytes=%d, node_id=%s",
+                raw_nbytes,
+                self.l3_budget_bytes,
+                node.id,
+            )
+            return None
+
+        if file_path is None:
+            file_path = self.l3_run_dir / f"node-{node.id}.bin"
         try:
             with open(file_path, "wb", buffering=0) as f:
                 for segment in segments:
@@ -551,11 +724,18 @@ class UnifiedRadixCache(RadixCache):
             last_access_time=now,
             node=node,
         )
+        if register:
+            self._register_l3_entry(node, entry, reason)
+        return entry
+
+    def _register_l3_entry(self, node: TreeNode, entry: L3Entry, reason: str):
+        entry.node_id = node.id
+        entry.node = node
         node.l3_entry = entry
         self.l3_entries[node.id] = entry
-        self.stats.used_bytes += raw_nbytes
+        self.stats.used_bytes += entry.nbytes
         self.stats.write_count += 1
-        self.stats.write_bytes += raw_nbytes
+        self.stats.write_bytes += entry.nbytes
         logger.info(
             "UnifiedRadixCache L3 write: node_id=%s, reason=%s, token_count=%d, "
             "page_count=%d, write_bytes=%d, aligned_bytes=%d, used_bytes=%d, "
@@ -571,7 +751,6 @@ class UnifiedRadixCache(RadixCache):
             self.stats.write_count,
             self.stats.write_bytes,
         )
-        return entry
 
     def _build_segments(self, kv_cpu: List[List[Any]]):
         segments = []
@@ -627,9 +806,76 @@ class UnifiedRadixCache(RadixCache):
             layers[layer_id][chunk_id] = [pair["k"], pair["v"]]
         return layers
 
+    def _slice_kv_cpu(self, kv_cpu, start: int, end: int):
+        chunk_size = getattr(self.kv_cache, "cpu_offloading_chunk_size", end - start)
+        token_count = end - start
+        sliced = []
+
+        for layer_chunks in kv_cpu:
+            k_pieces = []
+            v_pieces = []
+            offset = 0
+            for k_cpu, v_cpu in layer_chunks:
+                chunk_len = k_cpu.shape[0]
+                overlap_start = max(start, offset)
+                overlap_end = min(end, offset + chunk_len)
+                if overlap_start < overlap_end:
+                    local_start = overlap_start - offset
+                    local_end = overlap_end - offset
+                    k_pieces.append(k_cpu[local_start:local_end])
+                    v_pieces.append(v_cpu[local_start:local_end])
+                offset += chunk_len
+
+            if not k_pieces:
+                raise RuntimeError(
+                    f"Cannot slice empty L3 KV range: start={start}, end={end}"
+                )
+
+            k_full = torch.cat(k_pieces, dim=0) if len(k_pieces) > 1 else k_pieces[0]
+            v_full = torch.cat(v_pieces, dim=0) if len(v_pieces) > 1 else v_pieces[0]
+            if k_full.shape[0] != token_count or v_full.shape[0] != token_count:
+                raise RuntimeError(
+                    "L3 KV slice length mismatch: "
+                    f"expected={token_count}, k={k_full.shape[0]}, v={v_full.shape[0]}"
+                )
+
+            layer_sliced = []
+            for chunk_start in range(0, token_count, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, token_count)
+                layer_sliced.append(
+                    [
+                        k_full[chunk_start:chunk_end].clone(),
+                        v_full[chunk_start:chunk_end].clone(),
+                    ]
+                )
+            sliced.append(layer_sliced)
+
+        return sliced
+
     def _get_cpu_segment_tensor(self, kv_cpu, segment: L3Segment):
         pair = kv_cpu[segment.layer_id][segment.chunk_id]
         return pair[0] if segment.kind == "k" else pair[1]
+
+    def _free_uninserted_value(self, value):
+        if (
+            value is not None
+            and isinstance(value, torch.Tensor)
+            and value.numel() > 0
+            and self.token_to_kv_pool_allocator is not None
+        ):
+            self.token_to_kv_pool_allocator.free(value)
+
+    def _remove_file_quietly(self, file_path: Path):
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "UnifiedRadixCache failed to remove temporary L3 file: file=%s, error=%s",
+                file_path,
+                exc,
+            )
 
     def _ensure_l3_budget(self, incoming_bytes: int, protected_node_id: int):
         while (
