@@ -620,7 +620,7 @@ class UnifiedRadixCache(RadixCache):
             path.append(node)
             node = node.parent
         for path_node in path:
-            if not path_node.evicted:
+            if not path_node.evicted and not self._has_l3_entry(path_node):
                 self._offload_node_to_l3(path_node, reason="finish-trigger")
 
     def _offload_node_to_l3(self, node: TreeNode, reason: str) -> int:
