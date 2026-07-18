@@ -1,8 +1,9 @@
 # UnifiedRadixCache Baseline
 
 This baseline is an experimental Jetson-oriented KV cache path for SGLang
-v0.5.4. It treats GPU/CPU unified memory as one DRAM tier and adds a synchronous
-L3 SSD tier behind the radix cache.
+v0.5.4. It treats GPU/CPU unified memory as one DRAM tier and adds an L3 SSD
+tier behind the radix cache. DRAM write-back uses a single-worker asynchronous
+backend by default, with a synchronous fallback for comparison and recovery.
 
 ## Scope
 
@@ -14,8 +15,13 @@ L3 SSD tier behind the radix cache.
   `--unified-radix-cache-l3-dir` and keeps metadata in memory only.
 - L3 files are raw per-entry files. Metadata tracks node id, token/page count,
   dtype, shape, byte offsets, and aligned file size.
-- L3 I/O is synchronous. There is no prefetch, async write-back, Mooncake, HF3FS,
-  NIXL, or remote KV backend in this baseline.
+- DRAM-to-SSD write-back can be `async` (default) or `sync`. Async mode performs
+  the existing CPU snapshot and raw-file write in one background thread, then
+  commits radix metadata and releases DRAM from the scheduler thread.
+- L3 restore and partial-node split I/O remain synchronous. There is no prefetch,
+  Mooncake, HF3FS, NIXL, or remote KV backend in this baseline.
+- Async writes are protected by radix reference locks. The queue is bounded and
+  a full finish-trigger queue skips the write without blocking the request.
 
 ## Reproduce
 
@@ -39,8 +45,14 @@ python3 -m sglang.launch_server \
   --unified-radix-cache-l3-dir /tmp/sglang-unified-radix-l3 \
   --unified-radix-cache-l3-budget-gb 1.0 \
   --unified-radix-cache-l3-block-size 4096 \
+  --unified-radix-cache-write-backend async \
+  --unified-radix-cache-max-pending-writes 8 \
   --unified-radix-cache-offload-after-finish-min-tokens 512
 ```
+
+Use `--unified-radix-cache-write-backend sync` for the original synchronous
+write-back behavior. `--unified-radix-cache-max-pending-writes` counts queued
+operations and excludes the single active or completed operation.
 
 Run the demo client in another shell in the same container:
 
@@ -72,6 +84,8 @@ cat /tmp/unified_radix_cache_demo.json
 The server log should show:
 
 - `UnifiedRadixCache enabled`
+- `async L3 write submitted`
+- `async L3 write finished`
 - `L3 write`
 - `L3 hit`
 - `L3 read`
@@ -82,3 +96,14 @@ The demo JSON reports recompute latency, restore latency, restore/recompute
 ratio, requested prompt length, prompt token counts returned by the server,
 cached token counts, and output non-empty checks. The server logs are the
 authoritative source for L3 byte counters and restore latency.
+
+## Async baseline limitations
+
+- The existing `MHATokenToKVPool.get_cpu_copy()` performs CUDA synchronization.
+  Moving it to a worker removes scheduler-thread blocking, but it does not
+  guarantee that GPU execution is completely stall-free.
+- L3 budget accounting excludes the one temporary file currently being written;
+  the budget is enforced before that file is committed as a cache entry.
+- Memory-pressure eviction waits for enough background operations to finish so
+  callers can allocate immediately after `evict()` returns. Finish-trigger
+  submission remains non-blocking.

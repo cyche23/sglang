@@ -5,9 +5,11 @@ These tests use a minimal MHA-compatible KV pool and allocator so the cache
 exercises real L3 file serialization without requiring a model server.
 """
 
-import tempfile
-import unittest
 import os
+import tempfile
+import threading
+import time
+import unittest
 
 import torch
 
@@ -30,12 +32,10 @@ class FakeAllocator:
         )
         self.free_pages = torch.arange(1, size + 1, dtype=torch.int64)
         self.k_buffers = [
-            torch.zeros((size + 1, 1, 1), dtype=torch.float32)
-            for _ in range(layer_num)
+            torch.zeros((size + 1, 1, 1), dtype=torch.float32) for _ in range(layer_num)
         ]
         self.v_buffers = [
-            torch.zeros((size + 1, 1, 1), dtype=torch.float32)
-            for _ in range(layer_num)
+            torch.zeros((size + 1, 1, 1), dtype=torch.float32) for _ in range(layer_num)
         ]
         self.freed = []
 
@@ -102,6 +102,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
             l3_dir=self.tmpdir.name,
             l3_budget_gb=0.01,
             l3_block_size=64,
+            write_backend="sync",
         )
 
     def tearDown(self):
@@ -208,9 +209,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(new_tail.evicted)
         self.assertIs(self._only_child(old_tail).parent, old_tail)
 
-        old_result = self.cache.match_prefix(
-            RadixKey([1, 2, 3, 4, 5, 6, 7, 8])
-        )
+        old_result = self.cache.match_prefix(RadixKey([1, 2, 3, 4, 5, 6, 7, 8]))
         self.assertEqual(len(old_result.device_indices), 3)
         self.assertEqual(old_result.host_hit_length, 5)
 
@@ -227,6 +226,254 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(prefix.evicted)
         self.assertFalse(tail.evicted)
         self.assertEqual(len(self.cache.l3_entries), 0)
+
+
+class TestUnifiedRadixCacheAsync(unittest.TestCase):
+    def setUp(self):
+        TreeNode.counter = 0
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.allocator = FakeAllocator()
+        self.cache = UnifiedRadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=self.allocator,
+            page_size=1,
+            l3_dir=self.tmpdir.name,
+            l3_budget_gb=0.01,
+            l3_block_size=64,
+            write_backend="async",
+            max_pending_writes=1,
+        )
+
+    def tearDown(self):
+        self.cache._stop_async_backend()
+        self.tmpdir.cleanup()
+
+    def _insert(self, tokens, base=10):
+        indices = self.allocator.alloc(len(tokens))
+        self.allocator.fill(indices, base)
+        self.cache.insert(RadixKey(tokens), indices)
+        return next(
+            node
+            for node in self.cache.root_node.children.values()
+            if node.key.token_ids[0] == tokens[0]
+        )
+
+    def _wait_for_async(self, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while self.cache._ongoing_writes and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+        self.cache.check_hicache_events()
+        self.assertFalse(self.cache._ongoing_writes)
+
+    def _install_blocking_writer(self):
+        started = threading.Event()
+        release = threading.Event()
+        original = self.cache._write_l3_entry_from_cpu
+
+        def blocking_writer(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return original(*args, **kwargs)
+
+        self.cache._write_l3_entry_from_cpu = blocking_writer
+        return started, release
+
+    def test_finish_trigger_submission_is_non_blocking(self):
+        node = self._insert([1, 2, 3, 4])
+        started, release = self._install_blocking_writer()
+        # Production allocators may expose device as a string rather than torch.device.
+        self.cache.device = "cpu"
+
+        begin = time.perf_counter()
+        self.assertEqual(
+            self.cache._offload_node_to_l3(node, reason="finish-trigger"), 0
+        )
+        submit_elapsed = time.perf_counter() - begin
+
+        self.assertLess(submit_elapsed, 0.1)
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertIsNotNone(node.value)
+        self.assertEqual(node.lock_ref, 1)
+        self.assertEqual(node.async_write_ref, 1)
+
+        release.set()
+        self._wait_for_async()
+        self.assertTrue(node.evicted)
+        self.assertIsNotNone(node.l3_entry)
+        self.assertEqual(node.lock_ref, 0)
+        self.assertEqual(node.async_write_ref, 0)
+        self.assertEqual(self.cache.stats.async_completed, 1)
+
+    def test_completion_keeps_dram_while_request_holds_lock(self):
+        node = self._insert([1, 2, 3, 4])
+        started, release = self._install_blocking_writer()
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.assertTrue(started.wait(timeout=1.0))
+
+        self.cache.inc_lock_ref(node)
+        release.set()
+        self._wait_for_async()
+
+        self.assertIsNotNone(node.value)
+        self.assertIsNotNone(node.l3_entry)
+        self.assertEqual(node.lock_ref, 1)
+        self.cache.dec_lock_ref(node)
+        self.cache._offload_exact_prefix([1, 2, 3, 4], extra_key=None)
+        self.assertTrue(node.evicted)
+
+    def test_backpressure_skips_without_locking_extra_node(self):
+        first = self._insert([1, 2], base=10)
+        second = self._insert([3, 4], base=20)
+        third = self._insert([5, 6], base=30)
+        started, release = self._install_blocking_writer()
+
+        self.cache._offload_node_to_l3(first, reason="finish-trigger")
+        self.assertTrue(started.wait(timeout=1.0))
+        self.cache._offload_node_to_l3(second, reason="finish-trigger")
+        self.cache._offload_node_to_l3(third, reason="finish-trigger")
+
+        self.assertEqual(len(self.cache._ongoing_writes), 2)
+        self.assertEqual(self.cache.stats.async_backpressure_skipped, 1)
+        self.assertEqual(third.lock_ref, 0)
+        self.assertEqual(
+            third.async_write_ref if hasattr(third, "async_write_ref") else 0, 0
+        )
+
+        release.set()
+        self._wait_for_async()
+        self.assertIsNotNone(third.value)
+
+    def test_split_during_write_discards_stale_result(self):
+        node = self._insert([1, 2, 3, 4])
+        started, release = self._install_blocking_writer()
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.assertTrue(started.wait(timeout=1.0))
+
+        self.cache.match_prefix(RadixKey([1, 2]))
+        release.set()
+        self._wait_for_async()
+
+        prefix = next(iter(self.cache.root_node.children.values()))
+        tail = next(iter(prefix.children.values()))
+        self.assertEqual(prefix.key.token_ids, [1, 2])
+        self.assertEqual(tail.key.token_ids, [3, 4])
+        self.assertIsNotNone(prefix.value)
+        self.assertIsNotNone(tail.value)
+        self.assertIsNone(prefix.l3_entry if hasattr(prefix, "l3_entry") else None)
+        self.assertIsNone(tail.l3_entry if hasattr(tail, "l3_entry") else None)
+        self.assertEqual(self.cache.stats.async_stale, 1)
+
+    def test_worker_failure_drops_unlocked_cache_node(self):
+        node = self._insert([1, 2, 3, 4])
+
+        def fail_snapshot(_indices):
+            raise RuntimeError("injected snapshot failure")
+
+        self.allocator.get_cpu_copy = fail_snapshot
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self._wait_for_async()
+
+        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertEqual(self.cache.stats.async_failed, 1)
+        self.assertEqual(node.lock_ref, 0)
+
+    def test_pressure_evict_waits_for_write_and_releases_tokens(self):
+        node = self._insert([1, 2, 3, 4])
+        self.cache.evict(4)
+
+        self.assertTrue(node.evicted)
+        self.assertIsNotNone(node.l3_entry)
+        self.assertGreaterEqual(self.cache.stats.async_released_tokens, 4)
+
+    def test_clear_removes_evicted_l3_subtree_and_restarts_worker(self):
+        node = self._insert([1, 2, 3, 4])
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self._wait_for_async()
+        self.assertTrue(node.evicted)
+
+        self.assertTrue(self.cache.clear_storage_backend())
+
+        self.assertEqual(len(self.cache.root_node.children), 0)
+        self.assertEqual(len(self.cache.l3_entries), 0)
+        self.assertIsNotNone(self.cache._async_backend)
+
+    def test_tp_slow_rank_delays_local_commit(self):
+        node = self._insert([1, 2, 3, 4])
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        deadline = time.monotonic() + 2.0
+        while (
+            self.cache._async_backend._result_queue.empty()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+
+        original_tp_min = self.cache._tp_min
+        self.cache._tp_min = lambda _value: 0
+        self.cache.check_hicache_events()
+        self.assertIsNotNone(node.value)
+        self.assertIn(node.id, self.cache._ongoing_writes)
+
+        self.cache._tp_min = original_tp_min
+        self._wait_for_async()
+        self.assertTrue(node.evicted)
+        self.assertIsNotNone(node.l3_entry)
+
+    def test_tp_peer_failure_rolls_back_local_success(self):
+        node = self._insert([1, 2, 3, 4])
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        deadline = time.monotonic() + 2.0
+        while (
+            self.cache._async_backend._result_queue.empty()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+
+        call_count = 0
+
+        def peer_fails_io(value):
+            nonlocal call_count
+            call_count += 1
+            return 0 if call_count == 2 else value
+
+        self.cache._tp_min = peer_fails_io
+        self.cache.check_hicache_events()
+
+        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertEqual(self.cache.stats.async_failed, 1)
+        self.assertFalse(os.path.exists(self.cache.l3_run_dir / f"node-{node.id}.bin"))
+
+    def test_reset_waits_for_active_worker_and_restarts_cleanly(self):
+        node = self._insert([1, 2, 3, 4])
+        started, release = self._install_blocking_writer()
+        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.assertTrue(started.wait(timeout=1.0))
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+
+        self.cache.reset()
+        timer.join()
+
+        self.assertEqual(len(self.cache.root_node.children), 0)
+        self.assertFalse(self.cache._ongoing_writes)
+        self.assertEqual(self.cache.stats.async_pending, 0)
+        self.assertIsNotNone(self.cache._async_backend)
+        self.assertEqual(list(self.cache.l3_run_dir.glob("*.tmp")), [])
+
+    def test_async_budget_evicts_old_l3_entry_on_commit(self):
+        first = self._insert([1, 2, 3, 4], base=10)
+        self.cache._offload_node_to_l3(first, reason="finish-trigger")
+        self._wait_for_async()
+        first_entry_bytes = first.l3_entry.nbytes
+        self.cache.l3_budget_bytes = first_entry_bytes
+
+        second = self._insert([5, 6, 7, 8], base=20)
+        self.cache._offload_node_to_l3(second, reason="finish-trigger")
+        self._wait_for_async()
+
+        self.assertNotIn(first, self.cache.root_node.children.values())
+        self.assertIsNotNone(second.l3_entry)
+        self.assertLessEqual(self.cache.stats.used_bytes, self.cache.l3_budget_bytes)
 
 
 if __name__ == "__main__":

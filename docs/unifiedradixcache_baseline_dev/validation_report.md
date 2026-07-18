@@ -119,6 +119,72 @@ Observed demo summary:
 }
 ```
 
+## Async Write-back Extension Validation
+
+Date: 2026-07-17
+
+Static and unit checks:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/sglang-pycache-async python3 -m py_compile \
+  python/sglang/srt/mem_cache/unified_radix_cache.py \
+  python/sglang/srt/server_args.py \
+  python/sglang/srt/managers/scheduler.py \
+  test/srt/test_unified_radix_cache_unit.py
+
+pre-commit run isort --files [CHANGED_PYTHON_FILES]
+pre-commit run ruff --files [CHANGED_SGLANG_PYTHON_FILES]
+pre-commit run black-jupyter --files [CHANGED_PYTHON_FILES]
+
+docker exec sglang-dev-v054 bash -lc \
+  'cd /codes/sglang && PYTHONPATH=python \
+   python3 test/srt/test_unified_radix_cache_unit.py'
+```
+
+Result: static checks and formatting passed; all 15 UnifiedRadixCache unit
+tests passed. The async tests cover non-blocking submission, active-request
+locking, queue backpressure, stale split results, worker failure, pressure
+eviction, budget eviction, reset/clear, and simulated TP readiness/failure.
+
+The existing server on port 8000 was left untouched. A separate async smoke
+server was launched on port 8001 with Qwen3-1.7B, a 2048-token pool,
+`--unified-radix-cache-write-backend async`, and
+`--unified-radix-cache-max-pending-writes 8`. The demo used:
+
+```bash
+python3 docs/unifiedradixcache_baseline_dev/unified_radix_cache_demo.py \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --prompt-len 64 \
+  --repeat 4 \
+  --max-new-tokens 8 \
+  --output /tmp/unified_radix_cache_async_smoke.json
+```
+
+Observed async timeline:
+
+```text
+async L3 write submitted: node_id=2, token_count=640
+HTTP POST /generate 200 OK
+L3 write: node_id=2, write_bytes=73400320
+async L3 write finished: node_id=2, committed=True,
+  freed_tokens=640, snapshot_ms=110.285, write_ms=200.142
+
+async L3 write submitted: node_id=3, token_count=576
+HTTP POST /generate 200 OK
+async L3 write finished: node_id=3, committed=True,
+  snapshot_ms=17.413, write_ms=144.218
+L3 hit: node_id=3, token_count=576
+L3 read: node_id=3, read_bytes=66060288
+L3 restore: node_id=3, token_count=576, latency_ms=46.739
+```
+
+The response preceding the corresponding write completion provides the runtime
+non-blocking evidence. Two later requests restored 576 cached tokens from L3;
+the best observed demo restore/recompute latency ratio was approximately 0.674.
+The temporary port-8001 server was stopped after validation. No signal or
+configuration change was sent to the pre-existing port-8000 server.
+
 ## L3 Budget Eviction Smoke
 
 Server command is the same as above except:

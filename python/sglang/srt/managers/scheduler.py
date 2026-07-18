@@ -745,6 +745,9 @@ class Scheduler(
                     l3_block_size=server_args.unified_radix_cache_l3_block_size,
                     eviction_policy=server_args.radix_eviction_policy,
                     offload_after_finish_min_tokens=server_args.unified_radix_cache_offload_after_finish_min_tokens,
+                    write_backend=server_args.unified_radix_cache_write_backend,
+                    max_pending_writes=server_args.unified_radix_cache_max_pending_writes,
+                    tp_cache_group=self.tp_cpu_group,
                     is_eagle=self.spec_algorithm.is_eagle(),
                     tp_rank=self.tp_rank,
                 )
@@ -1595,6 +1598,11 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # UnifiedRadixCache uses a single-result handoff to keep temporary L3
+        # usage bounded, so acknowledge completed writes on every scheduler turn.
+        if self.enable_unified_radix_cache:
+            self.tree_cache.check_hicache_events()
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1694,7 +1702,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_cache_load_back:
+        if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
@@ -2311,9 +2319,9 @@ class Scheduler(
         return FlushCacheReqOutput(success=success)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_cache_load_back:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical or unified cache storage cleared successfully!")
             if_success = True
         else:
             logging.warning("Hierarchical cache is not enabled.")
