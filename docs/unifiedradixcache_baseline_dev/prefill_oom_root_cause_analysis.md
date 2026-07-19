@@ -198,25 +198,23 @@ pressure eviction: DRAM + L3 backup -> L3 only
 
 实现要点如下：
 
-1. `_offload_node_to_l3()` 和 `_submit_async_write()` 的所有调用点都必须显式传入是否在 commit 后释放 DRAM，释放行为不再由 `reason` 字符串推断。
-2. finish-trigger 的 sync/async 写入成功后均保留 `node.value`；写入失败、TP peer failure、backpressure 或 stale result 也不会删除 DRAM subtree。
-3. pressure eviction 仍只从 device leaf 开始。有现成 L3 backup 时直接释放；没有 backup 时先写 L3，成功后释放。写入失败只允许丢弃仍然安全、未锁定且 value 未变化的 leaf。
-4. async pressure write 在提交和 commit 两处检查安全性。若写盘期间节点新增 resident descendant 或被外部锁定，L3 backup 可以提交，但 DRAM copy 不会释放。
-5. 新增任意深度 resident-descendant 检查；防御性遍历不会在 L3-only child 处剪枝。`_release_dram_copy()` 是最终拓扑防线，拒绝释放有锁或仍有 resident descendant 的节点。
-6. async pending capacity 只统计 `release_dram_on_commit=True` 的操作，finish backup 不会被误报成即将释放的 KV 容量。
-7. 建立、替换或淘汰 resident 节点的 L3 backup 不改变 `evictable_size_`；只有 DRAM 实际释放或恢复时才改变该计数。
+1. 每个非空、page-aligned 的 finished request 都按根到叶顺序尝试异步写 L3；队列满时非阻塞跳过，优先保留连续可恢复的 ancestor prefix。
+2. finish-trigger 成功后保留 `node.value`；写入失败、TP peer failure、backpressure 或 stale result 也不会删除 DRAM subtree。
+3. pressure eviction 只从 device leaf 开始，并且不提交或等待 L3 I/O。有现成 L3 backup 时直接释放 DRAM；没有 backup 时删除 leaf 及其不可独立恢复的 L3 descendants。
+4. pending finish write 通过 radix lock reference 保护，eviction 跳过这些节点；`_release_dram_copy()` 继续拒绝释放有锁或仍有 resident descendant 的节点。
+5. 建立、替换或淘汰 resident 节点的 L3 backup 不改变 `evictable_size_`；只有 DRAM 实际释放或恢复时才改变该计数。
 
-CLI 参数名与配置兼容性保持不变。`--unified-radix-cache-offload-after-finish-min-tokens` 的语义更新为“完成后建立 L3 backup”；若要观察 L3 restore，必须先通过显存压力把对应 leaf eviction 成 L3-only。
+UnifiedRadixCache 固定使用 async backend。`--unified-radix-cache-offload-after-finish-min-tokens` 和 `--unified-radix-cache-write-backend` 已删除，旧命令会报告未知参数。
 
 ## 修复后验证
 
 ### 单元与静态验证
 
 - `test/srt/test_unified_radix_cache_unit.py` 的 fake allocator 现在会在 `free()` 时真实归还 slot，并暴露 `available_size()`。
-- 新增/调整 sync 与 async 回归，覆盖分支树 finish backup、leaf-first pressure release、复用既有 backup、写入失败、TP peer failure、backpressure、stale result、写盘期间新增 child、pending finish write 计数和 L3 budget 淘汰 resident backup。
+- async 回归覆盖自动 finish backup、根到叶提交、leaf-first pressure release、未备份节点直接删除、写入失败、backpressure、stale result、pending write 跳过和 L3 budget 淘汰 resident backup。
 - 每条关键拓扑路径都断言不存在 “L3-only ancestor + DRAM-resident descendant”。
-- 目标测试结果：`23 passed`；仓库 pre-commit hooks 和 `git diff --check` 通过。
+- 目标测试、仓库 pre-commit hooks 和 `git diff --check` 必须通过。
 
 ### 端到端验证
 
-端到端结果在相同模型、40960 KV tokens、page size 64、arrival rate 0.02、20 trace instances、seed 42 下分别记录 sync 与 async。验收时同时检查：所有请求状态、OOM/scheduler exception、finish backup 的 `freed_tokens=0`，以及后续 pressure eviction 的实际释放日志。
+端到端结果使用相同模型、40960 KV tokens、page size 64、arrival rate 0.02、20 trace instances、seed 42，对比 async UnifiedRadixCache 与 disabled。验收时同时检查：所有请求状态、OOM/scheduler exception、只存在 finish-trigger 新 KV 写入、pressure eviction 没有写盘，以及后续 L3 restore 日志。

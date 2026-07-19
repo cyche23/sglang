@@ -744,8 +744,6 @@ class Scheduler(
                     l3_budget_gb=server_args.unified_radix_cache_l3_budget_gb,
                     l3_block_size=server_args.unified_radix_cache_l3_block_size,
                     eviction_policy=server_args.radix_eviction_policy,
-                    offload_after_finish_min_tokens=server_args.unified_radix_cache_offload_after_finish_min_tokens,
-                    write_backend=server_args.unified_radix_cache_write_backend,
                     max_pending_writes=server_args.unified_radix_cache_max_pending_writes,
                     tp_cache_group=self.tp_cpu_group,
                     is_eagle=self.spec_algorithm.is_eagle(),

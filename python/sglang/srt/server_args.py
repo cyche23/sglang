@@ -395,9 +395,7 @@ class ServerArgs:
     unified_radix_cache_l3_dir: str = "/tmp/sglang-unified-radix-l3"
     unified_radix_cache_l3_budget_gb: float = 1.0
     unified_radix_cache_l3_block_size: int = 4096
-    unified_radix_cache_offload_after_finish_min_tokens: int = 0
-    unified_radix_cache_write_backend: str = "async"
-    unified_radix_cache_max_pending_writes: int = 8
+    unified_radix_cache_max_pending_writes: int = 100
     # LMCache
     enable_lmcache: bool = False
 
@@ -1524,14 +1522,6 @@ class ServerArgs:
             if self.unified_radix_cache_l3_block_size <= 0:
                 raise ValueError(
                     "--unified-radix-cache-l3-block-size must be greater than 0 bytes."
-                )
-            if self.unified_radix_cache_offload_after_finish_min_tokens < 0:
-                raise ValueError(
-                    "--unified-radix-cache-offload-after-finish-min-tokens must be >= 0."
-                )
-            if self.unified_radix_cache_write_backend not in ("sync", "async"):
-                raise ValueError(
-                    "--unified-radix-cache-write-backend must be 'sync' or 'async'."
                 )
             if self.unified_radix_cache_max_pending_writes <= 0:
                 raise ValueError(
@@ -2798,18 +2788,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.unified_radix_cache_l3_block_size,
             help="UnifiedRadixCache L3 file alignment block size in bytes.",
-        )
-        parser.add_argument(
-            "--unified-radix-cache-offload-after-finish-min-tokens",
-            type=int,
-            default=ServerArgs.unified_radix_cache_offload_after_finish_min_tokens,
-            help="Default 0 disables finish-trigger L3 backup. When >0, finished requests with at least this many page-aligned tokens are backed up to L3 while their DRAM copies are retained until memory-pressure eviction.",
-        )
-        parser.add_argument(
-            "--unified-radix-cache-write-backend",
-            choices=["sync", "async"],
-            default=ServerArgs.unified_radix_cache_write_backend,
-            help="Select synchronous or single-worker asynchronous UnifiedRadixCache L3 write-back.",
         )
         parser.add_argument(
             "--unified-radix-cache-max-pending-writes",

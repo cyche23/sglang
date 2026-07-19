@@ -1,5 +1,11 @@
 # UnifiedRadixCache Validation Report
 
+> Historical results below document earlier baseline revisions. The current
+> implementation is async-only best-effort write-through: every page-aligned
+> finished request attempts an L3 backup, while memory-pressure eviction never
+> submits or waits for L3 writes. The removed finish-threshold and write-backend
+> CLI flags must not be used in new validation commands.
+
 Date: 2026-07-09
 
 Branch:
@@ -21,6 +27,27 @@ Target model:
 ```bash
 /models/Qwen3-1.7B/origin
 ```
+
+## Async Write-Through Validation
+
+Date: 2026-07-19
+
+- `test/srt/test_unified_radix_cache_unit.py`: `18 passed` in the Jetson
+  container. Coverage includes automatic finish backup, root-to-leaf
+  backpressure, non-blocking eviction, unbacked deletion, partial split/restore,
+  L3 budget eviction, reset/clear, and removed CLI options.
+- All changed-file pre-commit hooks passed, including AST, isort, ruff, Black,
+  and codespell.
+- A page-size-64, 40960-token, five-trace high-pressure smoke processed 60
+  request records before intentional interruption: 59 were HTTP 200/status
+  `ok`; the one interrupted in-flight request is not a server failure.
+- Server logs recorded 129 finish-trigger L3 writes, 41 pressure evictions, and
+  30 L3 restores. They recorded zero `reason=dram-evict` writes and no prefill
+  OOM, traceback, or scheduler exception.
+
+The original 20-instance trace with production arrival timing was not rerun in
+full during this change; the high-pressure smoke above is not a replacement for
+that long-running acceptance test.
 
 ## Static Checks
 
@@ -77,8 +104,7 @@ python3 -m sglang.launch_server \
   --enable-unified-radix-cache \
   --unified-radix-cache-l3-dir /tmp/sglang-unified-radix-l3-smoke \
   --unified-radix-cache-l3-budget-gb 1.0 \
-  --unified-radix-cache-l3-block-size 4096 \
-  --unified-radix-cache-offload-after-finish-min-tokens 128
+  --unified-radix-cache-l3-block-size 4096
 ```
 
 Demo command:
@@ -124,7 +150,7 @@ Observed demo summary:
 }
 ```
 
-## Async Write-back Extension Validation
+## Historical Async Write-back Extension Validation
 
 Date: 2026-07-17
 
@@ -152,8 +178,7 @@ locking, queue backpressure, stale split results, worker failure, pressure
 eviction, budget eviction, reset/clear, and simulated TP readiness/failure.
 
 The existing server on port 8000 was left untouched. A separate async smoke
-server was launched on port 8001 with Qwen3-1.7B, a 2048-token pool,
-`--unified-radix-cache-write-backend async`, and
+server was launched on port 8001 with Qwen3-1.7B, a 2048-token pool and
 `--unified-radix-cache-max-pending-writes 8`. The demo used:
 
 ```bash

@@ -2,8 +2,8 @@
 
 This baseline is an experimental Jetson-oriented KV cache path for SGLang
 v0.5.4. It treats GPU/CPU unified memory as one DRAM tier and adds an L3 SSD
-tier behind the radix cache. DRAM write-back uses a single-worker asynchronous
-backend by default, with a synchronous fallback for comparison and recovery.
+tier behind the radix cache. Finished KV is written through to L3 by a bounded,
+single-worker asynchronous backend.
 
 ## Scope
 
@@ -15,17 +15,18 @@ backend by default, with a synchronous fallback for comparison and recovery.
   `--unified-radix-cache-l3-dir` and keeps metadata in memory only.
 - L3 files are raw per-entry files. Metadata tracks node id, token/page count,
   dtype, shape, byte offsets, and aligned file size.
-- DRAM-to-SSD write-back can be `async` (default) or `sync`. Async mode performs
-  the existing CPU snapshot and raw-file write in one background thread, then
-  commits radix metadata from the scheduler thread. Finish-trigger writes retain
-  the DRAM copy; only leaf-based memory-pressure eviction releases DRAM.
+- Every non-empty page-aligned finished request attempts DRAM-to-SSD
+  write-through. The background worker performs the CPU snapshot and raw-file
+  write, then the scheduler thread commits radix metadata. Successful writes
+  retain the DRAM copy.
 - L3 restore and partial-node split I/O remain synchronous. There is no prefetch,
   Mooncake, HF3FS, NIXL, or remote KV backend in this baseline.
 - Async writes are protected by radix reference locks. The queue is bounded and
   a full finish-trigger queue skips the write without blocking the request.
 - DRAM residency is prefix-closed: an L3-only node cannot have a DRAM-resident
-  descendant. Finished requests create L3 backups, and pressure eviction walks
-  device leaves before releasing backed-up internal nodes.
+  descendant. Finish-trigger submits ancestors before suffix nodes. Pressure
+  eviction releases backed device leaves and drops unbacked leaves without
+  submitting or waiting for L3 I/O.
 
 ## Reproduce
 
@@ -49,15 +50,12 @@ python3 -m sglang.launch_server \
   --unified-radix-cache-l3-dir /tmp/sglang-unified-radix-l3 \
   --unified-radix-cache-l3-budget-gb 1.0 \
   --unified-radix-cache-l3-block-size 4096 \
-  --unified-radix-cache-write-backend async \
-  --unified-radix-cache-max-pending-writes 8 \
-  --unified-radix-cache-offload-after-finish-min-tokens 512
+  --unified-radix-cache-max-pending-writes 8
 ```
 
-Use `--unified-radix-cache-write-backend sync` for synchronous backup writes.
-Both backends retain finish-trigger DRAM copies. The
 `--unified-radix-cache-max-pending-writes` value counts queued operations and
-excludes the single active or completed operation.
+excludes the single active or completed operation. There is no synchronous
+write backend or finish-token threshold.
 
 Run the demo client in another shell in the same container:
 
@@ -109,6 +107,9 @@ authoritative source for L3 byte counters and restore latency.
   guarantee that GPU execution is completely stall-free.
 - L3 budget accounting excludes the one temporary file currently being written;
   the budget is enforced before that file is committed as a cache entry.
-- Memory-pressure eviction waits for enough background operations to finish so
-  callers can allocate immediately after `evict()` returns. Finish-trigger
-  submission remains non-blocking and never releases DRAM.
+- Memory-pressure eviction never waits for pending writes. Pending nodes are
+  lock-protected and skipped, so `evict()` may release fewer tokens than
+  requested when all candidates have an active finish-trigger write.
+- Backpressure, write failure, or L3 budget eviction can leave a node without a
+  backup. Memory pressure drops such an unlocked leaf and later requests
+  recompute it.
