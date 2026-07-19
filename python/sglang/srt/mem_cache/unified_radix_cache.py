@@ -209,6 +209,7 @@ class UnifiedRadixCache(RadixCache):
         l3_block_size: int,
         eviction_policy: str = "lru",
         max_pending_writes: int = 8,
+        debug: bool = False,
         tp_cache_group: Optional[torch.distributed.ProcessGroup] = None,
         is_eagle: bool = False,
         tp_rank: int = 0,
@@ -246,6 +247,7 @@ class UnifiedRadixCache(RadixCache):
             else 1
         )
         self.max_pending_writes = max_pending_writes
+        self.debug = debug
         self._write_generation = 0
         self._write_sequence = 0
         self._ongoing_writes: Dict[int, L3WriteOperation] = {}
@@ -253,7 +255,7 @@ class UnifiedRadixCache(RadixCache):
         self._async_backend: Optional[_AsyncL3WriteBackend] = None
 
         self.l3_run_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache enabled: l3_dir=%s, l3_run_dir=%s, "
             "l3_budget_bytes=%d, l3_budget_gb=%.3f, l3_block_size=%d, "
             "write_policy=async-write-through, max_pending_writes=%d",
@@ -275,6 +277,10 @@ class UnifiedRadixCache(RadixCache):
         )
         self.root_node.async_write_ref = 0
         self._start_async_backend()
+
+    def _log_info(self, msg, *args, **kwargs):
+        if self.debug:
+            logger.info(msg, *args, **kwargs)
 
     def reset(self):
         self._stop_async_backend()
@@ -414,7 +420,7 @@ class UnifiedRadixCache(RadixCache):
         if node.id in self._ongoing_writes:
             return False
         if self._has_external_lock(node):
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache async L3 write skipped: node_id=%s, "
                 "reason=%s, external_lock_ref=%d",
                 node.id,
@@ -425,7 +431,7 @@ class UnifiedRadixCache(RadixCache):
         # max_pending_writes excludes the one active/result operation.
         if len(self._ongoing_writes) >= self.max_pending_writes + 1:
             self.stats.async_backpressure_skipped += 1
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache async L3 write skipped by backpressure: "
                 "node_id=%s, reason=%s, outstanding=%d, max_pending=%d",
                 node.id,
@@ -459,7 +465,7 @@ class UnifiedRadixCache(RadixCache):
 
         self.stats.async_submitted += 1
         self.stats.async_pending = len(self._ongoing_writes)
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache async L3 write submitted: node_id=%s, "
             "sequence_id=%d, reason=%s, token_count=%d, outstanding=%d",
             node.id,
@@ -560,7 +566,7 @@ class UnifiedRadixCache(RadixCache):
         )
         self.stats.async_snapshot_latency_ms += result.snapshot_latency_ms
         self.stats.async_write_latency_ms += result.write_latency_ms
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache async L3 write finished: node_id=%s, "
             "sequence_id=%d, committed=%s, stale=%s, error=%s, "
             "outstanding=%d, snapshot_ms=%.3f, write_ms=%.3f",
@@ -638,7 +644,7 @@ class UnifiedRadixCache(RadixCache):
 
         if l3_hit_length > 0:
             self.stats.hit_count += 1
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache L3 hit: node_id=%s, token_count=%d, "
                 "page_count=%d, used_bytes=%d, hits=%d, misses=%d",
                 last_l3_node.id,
@@ -650,7 +656,7 @@ class UnifiedRadixCache(RadixCache):
             )
         else:
             self.stats.miss_count += 1
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache L3 miss: last_node_id=%s, reason=%s, "
                 "used_bytes=%d, hits=%d, misses=%d",
                 last_node.id,
@@ -693,7 +699,7 @@ class UnifiedRadixCache(RadixCache):
                     if split_status in ("read-failure", "missing-entry"):
                         break
                     self._free_uninserted_value(value)
-                    logger.info(
+                    self._log_info(
                         "UnifiedRadixCache insert skipped after partial L3 split "
                         "failure: node_id=%s, status=%s, preserved_subtree=True",
                         child.id,
@@ -766,7 +772,7 @@ class UnifiedRadixCache(RadixCache):
                 leaves.append(parent)
                 leaves.sort(key=lambda n: self.eviction_strategy.get_priority(n))
 
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache pressure eviction finished: policy=write-through, "
             "requested_tokens=%d, freed_tokens=%d",
             num_tokens,
@@ -801,7 +807,7 @@ class UnifiedRadixCache(RadixCache):
                 ancestor_node,
             )
         if mem_quota is not None and total_tokens > mem_quota:
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache L3 restore skipped: token_count=%d exceeds mem_quota=%d",
                 total_tokens,
                 mem_quota,
@@ -864,7 +870,7 @@ class UnifiedRadixCache(RadixCache):
         latency_ms = (time.perf_counter() - start_time) * 1000
         self.stats.read_count += 1
         self.stats.read_bytes += restored_bytes
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache L3 read: node_id=%s, token_count=%d, page_count=%d, "
             "read_bytes=%d, total_read_count=%d, total_read_bytes=%d",
             last_hit_node.id,
@@ -874,7 +880,7 @@ class UnifiedRadixCache(RadixCache):
             self.stats.read_count,
             self.stats.read_bytes,
         )
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache L3 restore: node_id=%s, token_count=%d, "
             "page_count=%d, latency_ms=%.3f, used_bytes=%d",
             last_hit_node.id,
@@ -1064,7 +1070,7 @@ class UnifiedRadixCache(RadixCache):
         self._record_store_event(new_node)
         self._record_store_event(child)
 
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache partial-l3-split: old_node_id=%s, "
             "prefix_node_id=%s, tail_node_id=%s, split_tokens=%d, "
             "tail_tokens=%d, child_count=%d, reason=%s, used_bytes=%d",
@@ -1100,7 +1106,7 @@ class UnifiedRadixCache(RadixCache):
         if node.value is None:
             return 0
         if node.lock_ref != 0:
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache DRAM release skipped: node_id=%s, "
                 "reason=%s, lock_ref=%d",
                 node.id,
@@ -1121,7 +1127,7 @@ class UnifiedRadixCache(RadixCache):
         node.value = None
         self.evictable_size_ -= token_count
         self._record_remove_event(node)
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache DRAM copy released: node_id=%s, reason=%s, "
             "token_count=%d",
             node.id,
@@ -1195,7 +1201,7 @@ class UnifiedRadixCache(RadixCache):
         self.stats.used_bytes += entry.nbytes
         self.stats.write_count += 1
         self.stats.write_bytes += entry.nbytes
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache L3 write: node_id=%s, reason=%s, token_count=%d, "
             "page_count=%d, write_bytes=%d, aligned_bytes=%d, used_bytes=%d, "
             "budget_bytes=%d, total_write_count=%d, total_write_bytes=%d",
@@ -1358,7 +1364,7 @@ class UnifiedRadixCache(RadixCache):
         self.stats.eviction_bytes += evicted_bytes
         if node.value is None and node != self.root_node:
             self._drop_subtree(node, reason=f"l3-{reason}-eviction")
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache L3 eviction: node_id=%s, reason=%s, "
             "evicted_bytes=%d, used_bytes=%d, total_evictions=%d, "
             "total_eviction_bytes=%d",
@@ -1406,7 +1412,7 @@ class UnifiedRadixCache(RadixCache):
                 if child is node:
                     del node.parent.children[key]
                     break
-        logger.info(
+        self._log_info(
             "UnifiedRadixCache dropped radix subtree: node_id=%s, reason=%s",
             node.id,
             reason,
@@ -1429,7 +1435,7 @@ class UnifiedRadixCache(RadixCache):
         if hasattr(self, "l3_run_dir"):
             shutil.rmtree(self.l3_run_dir, ignore_errors=True)
             self.l3_run_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(
+            self._log_info(
                 "UnifiedRadixCache L3 cache directory reset: l3_run_dir=%s",
                 self.l3_run_dir,
             )

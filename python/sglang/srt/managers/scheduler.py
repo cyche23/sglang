@@ -745,6 +745,7 @@ class Scheduler(
                     l3_block_size=server_args.unified_radix_cache_l3_block_size,
                     eviction_policy=server_args.radix_eviction_policy,
                     max_pending_writes=server_args.unified_radix_cache_max_pending_writes,
+                    debug=server_args.unified_radix_cache_debug,
                     tp_cache_group=self.tp_cpu_group,
                     is_eagle=self.spec_algorithm.is_eagle(),
                     tp_rank=self.tp_rank,

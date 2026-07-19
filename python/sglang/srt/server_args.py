@@ -396,6 +396,7 @@ class ServerArgs:
     unified_radix_cache_l3_budget_gb: float = 1.0
     unified_radix_cache_l3_block_size: int = 4096
     unified_radix_cache_max_pending_writes: int = 100
+    unified_radix_cache_debug: bool = False
     # LMCache
     enable_lmcache: bool = False
 
@@ -2794,6 +2795,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.unified_radix_cache_max_pending_writes,
             help="Maximum queued UnifiedRadixCache async writes, excluding the active write.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-debug",
+            action="store_true",
+            help="Enable info-level debug logs for UnifiedRadixCache.",
         )
         # LMCache
         parser.add_argument(
