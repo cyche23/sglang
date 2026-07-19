@@ -104,6 +104,11 @@ UnifiedRadixCache L3 restore: node_id=8, token_count=2048, latency_ms=151.523
 UnifiedRadixCache L3 write: node_id=8, reason=finish-trigger, token_count=2048
 ```
 
+Finish-trigger now creates a backup-only L3 entry. It intentionally retains the
+DRAM copy, so an immediate repeat can remain a DRAM hit. To validate `L3 hit`,
+`L3 read`, and `L3 restore`, first apply enough memory pressure for leaf-based
+eviction to log `DRAM copy released` for the backed-up prefix.
+
 Observed demo summary:
 
 ```json

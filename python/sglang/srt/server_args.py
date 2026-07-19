@@ -2803,7 +2803,7 @@ class ServerArgs:
             "--unified-radix-cache-offload-after-finish-min-tokens",
             type=int,
             default=ServerArgs.unified_radix_cache_offload_after_finish_min_tokens,
-            help="Default 0 disables explicit demo offload. When >0, finished requests with at least this many page-aligned tokens are offloaded to L3.",
+            help="Default 0 disables finish-trigger L3 backup. When >0, finished requests with at least this many page-aligned tokens are backed up to L3 while their DRAM copies are retained until memory-pressure eviction.",
         )
         parser.add_argument(
             "--unified-radix-cache-write-backend",

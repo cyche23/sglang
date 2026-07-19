@@ -49,9 +49,15 @@ class FakeAllocator:
         self.free_pages = self.free_pages[need_size:]
         return indices
 
+    def available_size(self):
+        return len(self.free_pages)
+
     def free(self, free_index: torch.Tensor):
         if free_index is not None and free_index.numel() > 0:
             self.freed.append(free_index.clone())
+            self.free_pages = torch.unique(
+                torch.cat((self.free_pages, free_index.to(dtype=torch.int64)))
+            )
 
     def fill(self, indices: torch.Tensor, base: int):
         positions = torch.arange(len(indices), dtype=torch.float32)
@@ -112,6 +118,19 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertEqual(len(node.children), 1)
         return next(iter(node.children.values()))
 
+    def _assert_dram_residency_is_prefix_closed(self):
+        stack = [(self.cache.root_node, False)]
+        while stack:
+            node, has_evicted_ancestor = stack.pop()
+            if node != self.cache.root_node and not node.evicted:
+                self.assertFalse(has_evicted_ancestor)
+            next_has_evicted_ancestor = has_evicted_ancestor or (
+                node != self.cache.root_node and node.evicted
+            )
+            stack.extend(
+                (child, next_has_evicted_ancestor) for child in node.children.values()
+            )
+
     def _insert_with_filled_indices(self, tokens, base):
         indices = self.allocator.alloc(len(tokens))
         self.allocator.fill(indices, base)
@@ -124,8 +143,8 @@ class TestUnifiedRadixCache(unittest.TestCase):
 
         parent = self._only_child(self.cache.root_node)
         child = self._only_child(parent)
-        self.cache._offload_node_to_l3(child, reason="unit-test")
-        self.cache._offload_node_to_l3(parent, reason="unit-test")
+        self.cache._offload_node_to_l3(child, reason="unit-test", release_dram=True)
+        self.cache._offload_node_to_l3(parent, reason="unit-test", release_dram=True)
         return parent, child
 
     def test_match_splits_evicted_l3_node_and_preserves_tail_children(self):
@@ -227,6 +246,84 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(tail.evicted)
         self.assertEqual(len(self.cache.l3_entries), 0)
 
+    def test_finish_backup_keeps_branch_resident_until_pressure_evict(self):
+        self._insert_with_filled_indices([1, 2, 3, 4], base=10)
+        self._insert_with_filled_indices([1, 2, 5, 6], base=100)
+        parent = self._only_child(self.cache.root_node)
+        children = list(parent.children.values())
+        available_before = self.allocator.available_size()
+        evictable_before = self.cache.evictable_size()
+
+        self.cache._offload_exact_prefix([1, 2, 3, 4], extra_key=None)
+
+        self.assertFalse(parent.evicted)
+        self.assertTrue(all(not child.evicted for child in children))
+        self.assertIsNotNone(parent.l3_entry)
+        backed_child = next(
+            child for child in children if child.key.token_ids == [3, 4]
+        )
+        self.assertIsNotNone(backed_child.l3_entry)
+        self.assertEqual(self.allocator.available_size(), available_before)
+        self.assertEqual(self.cache.evictable_size(), evictable_before)
+        self._assert_dram_residency_is_prefix_closed()
+        write_count_after_backup = self.cache.stats.write_count
+
+        self.cache.evict(4)
+
+        self.assertTrue(all(child.evicted for child in children))
+        self.assertFalse(parent.evicted)
+        self.assertEqual(self.allocator.available_size(), available_before + 4)
+        self.assertEqual(self.cache.stats.write_count, write_count_after_backup + 1)
+        self._assert_dram_residency_is_prefix_closed()
+
+        write_count_before_parent_evict = self.cache.stats.write_count
+        self.cache.evict(2)
+        self.assertTrue(parent.evicted)
+        self.assertEqual(self.allocator.available_size(), available_before + 6)
+        self.assertEqual(self.cache.stats.write_count, write_count_before_parent_evict)
+        self._assert_dram_residency_is_prefix_closed()
+
+    def test_release_guard_rejects_parent_with_resident_descendants(self):
+        self._insert_with_filled_indices([1, 2, 3, 4], base=10)
+        self._insert_with_filled_indices([1, 2, 5, 6], base=100)
+        parent = self._only_child(self.cache.root_node)
+        available_before = self.allocator.available_size()
+
+        released = self.cache._release_dram_copy(parent, reason="unit-test")
+
+        self.assertEqual(released, 0)
+        self.assertFalse(parent.evicted)
+        self.assertEqual(self.allocator.available_size(), available_before)
+
+    def test_sync_finish_backup_failure_retains_dram(self):
+        self._insert_with_filled_indices([1, 2, 3, 4], base=10)
+        node = self._only_child(self.cache.root_node)
+        self.cache._write_l3_entry = lambda *_args, **_kwargs: None
+        available_before = self.allocator.available_size()
+
+        released = self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
+
+        self.assertEqual(released, 0)
+        self.assertFalse(node.evicted)
+        self.assertIn(node, self.cache.root_node.children.values())
+        self.assertEqual(self.allocator.available_size(), available_before)
+
+    def test_sync_pressure_write_failure_drops_safe_leaf(self):
+        self._insert_with_filled_indices([1, 2, 3, 4], base=10)
+        node = self._only_child(self.cache.root_node)
+        self.cache._write_l3_entry = lambda *_args, **_kwargs: None
+        available_before = self.allocator.available_size()
+
+        released = self.cache._offload_node_to_l3(
+            node, reason="dram-evict", release_dram=True
+        )
+
+        self.assertEqual(released, 4)
+        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertEqual(self.allocator.available_size(), available_before + 4)
+
 
 class TestUnifiedRadixCacheAsync(unittest.TestCase):
     def setUp(self):
@@ -258,6 +355,19 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
             if node.key.token_ids[0] == tokens[0]
         )
 
+    def _assert_dram_residency_is_prefix_closed(self):
+        stack = [(self.cache.root_node, False)]
+        while stack:
+            node, has_evicted_ancestor = stack.pop()
+            if node != self.cache.root_node and not node.evicted:
+                self.assertFalse(has_evicted_ancestor)
+            next_has_evicted_ancestor = has_evicted_ancestor or (
+                node != self.cache.root_node and node.evicted
+            )
+            stack.extend(
+                (child, next_has_evicted_ancestor) for child in node.children.values()
+            )
+
     def _wait_for_async(self, timeout=3.0):
         deadline = time.monotonic() + timeout
         while self.cache._ongoing_writes and time.monotonic() < deadline:
@@ -287,7 +397,10 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
 
         begin = time.perf_counter()
         self.assertEqual(
-            self.cache._offload_node_to_l3(node, reason="finish-trigger"), 0
+            self.cache._offload_node_to_l3(
+                node, reason="finish-trigger", release_dram=False
+            ),
+            0,
         )
         submit_elapsed = time.perf_counter() - begin
 
@@ -296,19 +409,24 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
         self.assertIsNotNone(node.value)
         self.assertEqual(node.lock_ref, 1)
         self.assertEqual(node.async_write_ref, 1)
+        self.assertFalse(self.cache._ongoing_writes[node.id].release_dram_on_commit)
 
         release.set()
         self._wait_for_async()
-        self.assertTrue(node.evicted)
+        self.assertFalse(node.evicted)
         self.assertIsNotNone(node.l3_entry)
         self.assertEqual(node.lock_ref, 0)
         self.assertEqual(node.async_write_ref, 0)
         self.assertEqual(self.cache.stats.async_completed, 1)
+        self.assertEqual(self.cache.stats.async_released_tokens, 0)
+        self._assert_dram_residency_is_prefix_closed()
 
     def test_completion_keeps_dram_while_request_holds_lock(self):
         node = self._insert([1, 2, 3, 4])
         started, release = self._install_blocking_writer()
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         self.assertTrue(started.wait(timeout=1.0))
 
         self.cache.inc_lock_ref(node)
@@ -320,6 +438,8 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
         self.assertEqual(node.lock_ref, 1)
         self.cache.dec_lock_ref(node)
         self.cache._offload_exact_prefix([1, 2, 3, 4], extra_key=None)
+        self.assertFalse(node.evicted)
+        self.cache.evict(4)
         self.assertTrue(node.evicted)
 
     def test_backpressure_skips_without_locking_extra_node(self):
@@ -328,10 +448,16 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
         third = self._insert([5, 6], base=30)
         started, release = self._install_blocking_writer()
 
-        self.cache._offload_node_to_l3(first, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            first, reason="finish-trigger", release_dram=False
+        )
         self.assertTrue(started.wait(timeout=1.0))
-        self.cache._offload_node_to_l3(second, reason="finish-trigger")
-        self.cache._offload_node_to_l3(third, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            second, reason="finish-trigger", release_dram=False
+        )
+        self.cache._offload_node_to_l3(
+            third, reason="finish-trigger", release_dram=False
+        )
 
         self.assertEqual(len(self.cache._ongoing_writes), 2)
         self.assertEqual(self.cache.stats.async_backpressure_skipped, 1)
@@ -347,7 +473,9 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
     def test_split_during_write_discards_stale_result(self):
         node = self._insert([1, 2, 3, 4])
         started, release = self._install_blocking_writer()
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         self.assertTrue(started.wait(timeout=1.0))
 
         self.cache.match_prefix(RadixKey([1, 2]))
@@ -364,32 +492,129 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
         self.assertIsNone(tail.l3_entry if hasattr(tail, "l3_entry") else None)
         self.assertEqual(self.cache.stats.async_stale, 1)
 
-    def test_worker_failure_drops_unlocked_cache_node(self):
+    def test_finish_backup_worker_failure_retains_unlocked_cache_node(self):
         node = self._insert([1, 2, 3, 4])
 
         def fail_snapshot(_indices):
             raise RuntimeError("injected snapshot failure")
 
         self.allocator.get_cpu_copy = fail_snapshot
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         self._wait_for_async()
 
-        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertIn(node, self.cache.root_node.children.values())
+        self.assertFalse(node.evicted)
+        self.assertIsNone(getattr(node, "l3_entry", None))
         self.assertEqual(self.cache.stats.async_failed, 1)
         self.assertEqual(node.lock_ref, 0)
 
     def test_pressure_evict_waits_for_write_and_releases_tokens(self):
         node = self._insert([1, 2, 3, 4])
+        available_before = self.allocator.available_size()
         self.cache.evict(4)
 
         self.assertTrue(node.evicted)
         self.assertIsNotNone(node.l3_entry)
         self.assertGreaterEqual(self.cache.stats.async_released_tokens, 4)
+        self.assertEqual(self.allocator.available_size(), available_before + 4)
+
+    def test_pressure_evict_reuses_finish_backup_without_rewriting(self):
+        node = self._insert([1, 2, 3, 4])
+        available_before = self.allocator.available_size()
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
+        self._wait_for_async()
+        write_count_after_backup = self.cache.stats.write_count
+
+        self.cache.evict(4)
+
+        self.assertTrue(node.evicted)
+        self.assertEqual(self.allocator.available_size(), available_before + 4)
+        self.assertEqual(self.cache.stats.write_count, write_count_after_backup)
+        self.assertEqual(self.cache.stats.async_released_tokens, 4)
+
+    def test_pending_finish_backup_is_not_counted_as_releasable_pressure(self):
+        backup_node = self._insert([1, 2, 3, 4])
+        pressure_node = self._insert([5, 6, 7, 8], base=20)
+        started, release = self._install_blocking_writer()
+        self.cache._offload_node_to_l3(
+            backup_node, reason="finish-trigger", release_dram=False
+        )
+        self.assertTrue(started.wait(timeout=1.0))
+
+        eviction = threading.Thread(target=self.cache.evict, args=(4,))
+        eviction.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            pressure_node.id not in self.cache._ongoing_writes
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+
+        self.assertIn(pressure_node.id, self.cache._ongoing_writes)
+        self.assertTrue(
+            self.cache._ongoing_writes[pressure_node.id].release_dram_on_commit
+        )
+        release.set()
+        eviction.join(timeout=3.0)
+
+        self.assertFalse(eviction.is_alive())
+        self.assertTrue(pressure_node.evicted or backup_node.evicted)
+        self._assert_dram_residency_is_prefix_closed()
+
+    def test_pressure_commit_does_not_release_new_internal_node(self):
+        node = self._insert([1, 2, 3, 4])
+        started, release = self._install_blocking_writer()
+        self.cache._offload_node_to_l3(node, reason="dram-evict", release_dram=True)
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertTrue(self.cache._ongoing_writes[node.id].release_dram_on_commit)
+
+        extension_indices = self.allocator.alloc(6)
+        self.allocator.fill(extension_indices, base=100)
+        self.cache.insert(RadixKey([1, 2, 3, 4, 5, 6]), extension_indices)
+        child = next(iter(node.children.values()))
+        self.assertFalse(child.evicted)
+
+        release.set()
+        self._wait_for_async()
+
+        self.assertFalse(node.evicted)
+        self.assertFalse(child.evicted)
+        self.assertIsNotNone(node.l3_entry)
+        self._assert_dram_residency_is_prefix_closed()
+
+        self.cache.evict(2)
+        self.assertTrue(child.evicted)
+        self.assertFalse(node.evicted)
+        self.cache.evict(4)
+        self.assertTrue(node.evicted)
+        self._assert_dram_residency_is_prefix_closed()
+
+    def test_pressure_worker_failure_drops_safe_leaf(self):
+        node = self._insert([1, 2, 3, 4])
+        available_before = self.allocator.available_size()
+
+        def fail_snapshot(_indices):
+            raise RuntimeError("injected pressure snapshot failure")
+
+        self.allocator.get_cpu_copy = fail_snapshot
+        self.cache.evict(4)
+
+        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertEqual(self.allocator.available_size(), available_before + 4)
+        self.assertEqual(self.cache.stats.async_failed, 1)
 
     def test_clear_removes_evicted_l3_subtree_and_restarts_worker(self):
         node = self._insert([1, 2, 3, 4])
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         self._wait_for_async()
+        self.assertFalse(node.evicted)
+        self.cache.evict(4)
         self.assertTrue(node.evicted)
 
         self.assertTrue(self.cache.clear_storage_backend())
@@ -400,7 +625,9 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
 
     def test_tp_slow_rank_delays_local_commit(self):
         node = self._insert([1, 2, 3, 4])
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         deadline = time.monotonic() + 2.0
         while (
             self.cache._async_backend._result_queue.empty()
@@ -416,12 +643,14 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
 
         self.cache._tp_min = original_tp_min
         self._wait_for_async()
-        self.assertTrue(node.evicted)
+        self.assertFalse(node.evicted)
         self.assertIsNotNone(node.l3_entry)
 
     def test_tp_peer_failure_rolls_back_local_success(self):
         node = self._insert([1, 2, 3, 4])
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         deadline = time.monotonic() + 2.0
         while (
             self.cache._async_backend._result_queue.empty()
@@ -439,14 +668,17 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
         self.cache._tp_min = peer_fails_io
         self.cache.check_hicache_events()
 
-        self.assertNotIn(node, self.cache.root_node.children.values())
+        self.assertIn(node, self.cache.root_node.children.values())
+        self.assertFalse(node.evicted)
         self.assertEqual(self.cache.stats.async_failed, 1)
         self.assertFalse(os.path.exists(self.cache.l3_run_dir / f"node-{node.id}.bin"))
 
     def test_reset_waits_for_active_worker_and_restarts_cleanly(self):
         node = self._insert([1, 2, 3, 4])
         started, release = self._install_blocking_writer()
-        self.cache._offload_node_to_l3(node, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            node, reason="finish-trigger", release_dram=False
+        )
         self.assertTrue(started.wait(timeout=1.0))
         timer = threading.Timer(0.05, release.set)
         timer.start()
@@ -462,16 +694,23 @@ class TestUnifiedRadixCacheAsync(unittest.TestCase):
 
     def test_async_budget_evicts_old_l3_entry_on_commit(self):
         first = self._insert([1, 2, 3, 4], base=10)
-        self.cache._offload_node_to_l3(first, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            first, reason="finish-trigger", release_dram=False
+        )
         self._wait_for_async()
         first_entry_bytes = first.l3_entry.nbytes
         self.cache.l3_budget_bytes = first_entry_bytes
 
         second = self._insert([5, 6, 7, 8], base=20)
-        self.cache._offload_node_to_l3(second, reason="finish-trigger")
+        self.cache._offload_node_to_l3(
+            second, reason="finish-trigger", release_dram=False
+        )
         self._wait_for_async()
 
-        self.assertNotIn(first, self.cache.root_node.children.values())
+        self.assertIn(first, self.cache.root_node.children.values())
+        self.assertFalse(first.evicted)
+        self.assertIsNone(getattr(first, "l3_entry", None))
+        self.assertFalse(second.evicted)
         self.assertIsNotNone(second.l3_entry)
         self.assertLessEqual(self.cache.stats.used_bytes, self.cache.l3_budget_bytes)
 

@@ -17,11 +17,15 @@ backend by default, with a synchronous fallback for comparison and recovery.
   dtype, shape, byte offsets, and aligned file size.
 - DRAM-to-SSD write-back can be `async` (default) or `sync`. Async mode performs
   the existing CPU snapshot and raw-file write in one background thread, then
-  commits radix metadata and releases DRAM from the scheduler thread.
+  commits radix metadata from the scheduler thread. Finish-trigger writes retain
+  the DRAM copy; only leaf-based memory-pressure eviction releases DRAM.
 - L3 restore and partial-node split I/O remain synchronous. There is no prefetch,
   Mooncake, HF3FS, NIXL, or remote KV backend in this baseline.
 - Async writes are protected by radix reference locks. The queue is bounded and
   a full finish-trigger queue skips the write without blocking the request.
+- DRAM residency is prefix-closed: an L3-only node cannot have a DRAM-resident
+  descendant. Finished requests create L3 backups, and pressure eviction walks
+  device leaves before releasing backed-up internal nodes.
 
 ## Reproduce
 
@@ -50,9 +54,10 @@ python3 -m sglang.launch_server \
   --unified-radix-cache-offload-after-finish-min-tokens 512
 ```
 
-Use `--unified-radix-cache-write-backend sync` for the original synchronous
-write-back behavior. `--unified-radix-cache-max-pending-writes` counts queued
-operations and excludes the single active or completed operation.
+Use `--unified-radix-cache-write-backend sync` for synchronous backup writes.
+Both backends retain finish-trigger DRAM copies. The
+`--unified-radix-cache-max-pending-writes` value counts queued operations and
+excludes the single active or completed operation.
 
 Run the demo client in another shell in the same container:
 
@@ -87,9 +92,9 @@ The server log should show:
 - `async L3 write submitted`
 - `async L3 write finished`
 - `L3 write`
-- `L3 hit`
-- `L3 read`
-- `L3 restore`
+- `DRAM copy released` and `pressure eviction finished` under memory pressure
+- `L3 hit`, `L3 read`, and `L3 restore` after a backed-up prefix has been
+  released by memory-pressure eviction
 - `L3 eviction` when the configured L3 budget is exceeded
 
 The demo JSON reports recompute latency, restore latency, restore/recompute
@@ -106,4 +111,4 @@ authoritative source for L3 byte counters and restore latency.
   the budget is enforced before that file is committed as a cache entry.
 - Memory-pressure eviction waits for enough background operations to finish so
   callers can allocate immediately after `evict()` returns. Finish-trigger
-  submission remains non-blocking.
+  submission remains non-blocking and never releases DRAM.

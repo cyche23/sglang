@@ -79,6 +79,7 @@ class L3WriteOperation:
     value: torch.Tensor
     token_count: int
     reason: str
+    release_dram_on_commit: bool
     file_path: Path
     submitted_at: float
 
@@ -415,7 +416,28 @@ class UnifiedRadixCache(RadixCache):
             current = current.parent
         return True
 
-    def _submit_async_write(self, node: TreeNode, reason: str) -> bool:
+    def _has_resident_descendant(self, node: TreeNode) -> bool:
+        stack = list(node.children.values())
+        while stack:
+            child = stack.pop()
+            if not child.evicted:
+                return True
+            # Traverse through L3-only nodes as a defensive check for mixed-tier
+            # holes left by an older implementation.
+            stack.extend(child.children.values())
+        return False
+
+    def _is_safe_to_release_dram(self, node: TreeNode) -> bool:
+        return (
+            node != self.root_node
+            and not node.evicted
+            and node.lock_ref == 0
+            and not self._has_resident_descendant(node)
+        )
+
+    def _submit_async_write(
+        self, node: TreeNode, reason: str, release_dram_on_commit: bool
+    ) -> bool:
         if self._async_backend is None or node.value is None or node.evicted:
             return False
         if node.id in self._ongoing_writes:
@@ -427,6 +449,14 @@ class UnifiedRadixCache(RadixCache):
                 node.id,
                 reason,
                 node.lock_ref - self._get_async_write_ref(node),
+            )
+            return False
+        if release_dram_on_commit and self._has_resident_descendant(node):
+            logger.warning(
+                "UnifiedRadixCache async L3 write skipped DRAM release intent: "
+                "node_id=%s, reason=%s, resident_descendant=True",
+                node.id,
+                reason,
             )
             return False
         # max_pending_writes excludes the one active/result operation.
@@ -453,6 +483,7 @@ class UnifiedRadixCache(RadixCache):
             value=node.value,
             token_count=len(node.value),
             reason=reason,
+            release_dram_on_commit=release_dram_on_commit,
             file_path=self.l3_run_dir
             / f"node-{node.id}.write-{self._write_generation}-{self._write_sequence}.tmp",
             submitted_at=time.monotonic(),
@@ -468,10 +499,12 @@ class UnifiedRadixCache(RadixCache):
         self.stats.async_pending = len(self._ongoing_writes)
         logger.info(
             "UnifiedRadixCache async L3 write submitted: node_id=%s, "
-            "sequence_id=%d, reason=%s, token_count=%d, outstanding=%d",
+            "sequence_id=%d, reason=%s, release_dram_on_commit=%s, "
+            "token_count=%d, outstanding=%d",
             node.id,
             operation.sequence_id,
             reason,
+            release_dram_on_commit,
             operation.token_count,
             len(self._ongoing_writes),
         )
@@ -558,17 +591,19 @@ class UnifiedRadixCache(RadixCache):
         freed_tokens = 0
         if committed:
             self.stats.async_completed += 1
-            if node.lock_ref == 0 and node.value is operation.value:
-                freed_tokens = self._release_dram_copy(node)
+            if operation.release_dram_on_commit and node.value is operation.value:
+                freed_tokens = self._release_dram_copy(node, reason=operation.reason)
         elif all_io_success and not all_current:
             self.stats.async_stale += 1
         else:
             self.stats.async_failed += 1
             if (
-                attached
+                operation.release_dram_on_commit
+                and attached
                 and node.lock_ref == 0
                 and node.value is operation.value
                 and tuple(node.key.token_ids) == operation.key_token_ids
+                and not self._has_resident_descendant(node)
             ):
                 freed_tokens = len(node.value)
                 self._drop_subtree(node, reason="async-l3-write-failure")
@@ -583,12 +618,14 @@ class UnifiedRadixCache(RadixCache):
         logger.info(
             "UnifiedRadixCache async L3 write finished: node_id=%s, "
             "sequence_id=%d, committed=%s, stale=%s, error=%s, "
+            "release_dram_on_commit=%s, "
             "freed_tokens=%d, outstanding=%d, snapshot_ms=%.3f, write_ms=%.3f",
             operation.node_id,
             operation.sequence_id,
             committed,
             bool(all_io_success and not all_current),
             result.error,
+            operation.release_dram_on_commit,
             freed_tokens,
             len(self._ongoing_writes),
             result.snapshot_latency_ms,
@@ -776,7 +813,9 @@ class UnifiedRadixCache(RadixCache):
             if node == self.root_node or node.lock_ref > 0 or node.evicted:
                 continue
 
-            evicted = self._offload_node_to_l3(node, reason="dram-evict")
+            evicted = self._offload_node_to_l3(
+                node, reason="dram-evict", release_dram=True
+            )
             num_evicted += evicted
 
             parent = node.parent
@@ -790,6 +829,13 @@ class UnifiedRadixCache(RadixCache):
                 leaves.append(parent)
                 leaves.sort(key=lambda n: self.eviction_strategy.get_priority(n))
 
+        logger.info(
+            "UnifiedRadixCache pressure eviction finished: backend=sync, "
+            "requested_tokens=%d, freed_tokens=%d",
+            num_tokens,
+            num_evicted,
+        )
+
     def _evict_async(self, num_tokens: int):
         num_evicted = self._drain_async_results(block=False)
         while num_evicted < num_tokens:
@@ -799,7 +845,8 @@ class UnifiedRadixCache(RadixCache):
             pending_tokens = sum(
                 operation.token_count
                 for operation in self._ongoing_writes.values()
-                if operation.node.value is operation.value
+                if operation.release_dram_on_commit
+                and operation.node.value is operation.value
                 and not self._has_external_lock(operation.node)
             )
 
@@ -814,10 +861,16 @@ class UnifiedRadixCache(RadixCache):
                     continue
                 if self._has_l3_entry(node):
                     if node.lock_ref == 0:
-                        num_evicted += self._release_dram_copy(node)
+                        released = self._release_dram_copy(node, reason="dram-evict")
+                        num_evicted += released
+                        self.stats.async_released_tokens += released
                         made_progress = True
                     continue
-                if self._submit_async_write(node, reason="dram-evict"):
+                if self._submit_async_write(
+                    node,
+                    reason="dram-evict",
+                    release_dram_on_commit=True,
+                ):
                     made_progress = True
                     pending_tokens += len(node.value)
 
@@ -834,6 +887,13 @@ class UnifiedRadixCache(RadixCache):
                 not self._ongoing_writes and not self._collect_leaves_device()
             ):
                 break
+
+        logger.info(
+            "UnifiedRadixCache pressure eviction finished: backend=async, "
+            "requested_tokens=%d, freed_tokens=%d",
+            num_tokens,
+            num_evicted,
+        )
 
     def init_load_back(
         self,
@@ -1158,17 +1218,27 @@ class UnifiedRadixCache(RadixCache):
             if not path_node.evicted and (
                 self.write_backend == "async" or not self._has_l3_entry(path_node)
             ):
-                self._offload_node_to_l3(path_node, reason="finish-trigger")
+                self._offload_node_to_l3(
+                    path_node,
+                    reason="finish-trigger",
+                    release_dram=False,
+                )
 
-    def _offload_node_to_l3(self, node: TreeNode, reason: str) -> int:
+    def _offload_node_to_l3(
+        self, node: TreeNode, reason: str, release_dram: bool
+    ) -> int:
         if node.evicted or node.value is None:
             return 0
         if self.write_backend == "async":
             if self._has_l3_entry(node):
-                if node.lock_ref == 0:
-                    return self._release_dram_copy(node)
+                if release_dram:
+                    return self._release_dram_copy(node, reason=reason)
                 return 0
-            self._submit_async_write(node, reason)
+            self._submit_async_write(
+                node,
+                reason,
+                release_dram_on_commit=release_dram,
+            )
             return 0
         if node.lock_ref > 0:
             logger.info(
@@ -1179,33 +1249,78 @@ class UnifiedRadixCache(RadixCache):
             )
             return 0
 
+        if self._has_l3_entry(node):
+            if release_dram:
+                return self._release_dram_copy(node, reason=reason)
+            return 0
+
+        if release_dram and self._has_resident_descendant(node):
+            logger.warning(
+                "UnifiedRadixCache L3 write skipped DRAM release intent: "
+                "node_id=%s, reason=%s, resident_descendant=True",
+                node.id,
+                reason,
+            )
+            return 0
+
         token_count = len(node.value)
         entry = self._write_l3_entry(node, reason)
         if entry is None:
-            self._drop_subtree(node, reason="l3-write-failure")
+            if release_dram and self._is_safe_to_release_dram(node):
+                self._drop_subtree(node, reason="l3-write-failure")
+                logger.warning(
+                    "UnifiedRadixCache L3 write failed; evicted DRAM without "
+                    "L3 backup: node_id=%s, token_count=%d, reason=%s",
+                    node.id,
+                    token_count,
+                    reason,
+                )
+                return token_count
             logger.warning(
-                "UnifiedRadixCache L3 write failed; evicted DRAM without L3 backup: "
+                "UnifiedRadixCache L3 backup failed; DRAM retained: "
                 "node_id=%s, token_count=%d, reason=%s",
                 node.id,
                 token_count,
                 reason,
             )
-            return token_count
+            return 0
 
-        self.token_to_kv_pool_allocator.free(node.value)
-        node.value = None
-        self.evictable_size_ -= token_count
-        self._record_remove_event(node)
-        return token_count
+        if not release_dram:
+            return 0
+        return self._release_dram_copy(node, reason=reason)
 
-    def _release_dram_copy(self, node: TreeNode) -> int:
-        if node.value is None or node.lock_ref != 0:
+    def _release_dram_copy(self, node: TreeNode, reason: str) -> int:
+        if node.value is None:
+            return 0
+        if node.lock_ref != 0:
+            logger.info(
+                "UnifiedRadixCache DRAM release skipped: node_id=%s, "
+                "reason=%s, lock_ref=%d",
+                node.id,
+                reason,
+                node.lock_ref,
+            )
+            return 0
+        if self._has_resident_descendant(node):
+            logger.warning(
+                "UnifiedRadixCache DRAM release skipped: node_id=%s, "
+                "reason=%s, resident_descendant=True",
+                node.id,
+                reason,
+            )
             return 0
         token_count = len(node.value)
         self.token_to_kv_pool_allocator.free(node.value)
         node.value = None
         self.evictable_size_ -= token_count
         self._record_remove_event(node)
+        logger.info(
+            "UnifiedRadixCache DRAM copy released: node_id=%s, reason=%s, "
+            "token_count=%d",
+            node.id,
+            reason,
+            token_count,
+        )
         return token_count
 
     def _write_l3_entry(self, node: TreeNode, reason: str) -> Optional[L3Entry]:
