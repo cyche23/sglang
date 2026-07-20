@@ -397,6 +397,7 @@ class ServerArgs:
     unified_radix_cache_l3_block_size: int = 4096
     unified_radix_cache_max_pending_writes: int = 100
     unified_radix_cache_debug: bool = False
+    unified_radix_cache_profile_path: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
 
@@ -1516,6 +1517,11 @@ class ServerArgs:
                 "The arguments enable-unified-radix-cache and enable-lmcache are mutually exclusive."
             )
         if self.enable_unified_radix_cache:
+            if self.tp_size != 1 or self.pp_size != 1 or self.dp_size != 1:
+                raise ValueError(
+                    "--enable-unified-radix-cache currently supports exactly "
+                    "one device (tp-size=pp-size=dp-size=1)."
+                )
             if self.unified_radix_cache_l3_budget_gb <= 0:
                 raise ValueError(
                     "--unified-radix-cache-l3-budget-gb must be greater than 0."
@@ -2800,6 +2806,12 @@ class ServerArgs:
             "--unified-radix-cache-debug",
             action="store_true",
             help="Enable info-level debug logs for UnifiedRadixCache.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-profile-path",
+            type=str,
+            default=ServerArgs.unified_radix_cache_profile_path,
+            help="Optional JSONL path for non-blocking UnifiedRadixCache timing events.",
         )
         # LMCache
         parser.add_argument(

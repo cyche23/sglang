@@ -87,6 +87,7 @@ class BasePrefixCache(ABC):
         self,
         last_host_node: Any,
         host_hit_length: int,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.

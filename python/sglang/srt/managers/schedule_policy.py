@@ -448,6 +448,12 @@ class PrefillAdder:
 
     def add_chunked_req(self, req: Req):
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        # Cache capacity can change asynchronously between chunks (for
+        # example, while an L3 restore commits). A zero-sized forward is not a
+        # valid batch; leave the request pending and retry after cache events
+        # make capacity available.
+        if _rem_tokens <= 0:
+            return req
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -591,7 +597,9 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    req.last_host_node,
+                    req.host_hit_length,
+                    request_id=req.rid,
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)

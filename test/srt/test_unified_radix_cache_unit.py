@@ -3,7 +3,6 @@
 import argparse
 import dataclasses
 import heapq
-import os
 import tempfile
 import threading
 import time
@@ -21,7 +20,11 @@ from sglang.srt.server_args import ServerArgs
 
 class FakeMHAKVPool(MHATokenToKVPool):
     def __init__(self, layer_num=2, cpu_offloading_chunk_size=4):
+        self.device = torch.device("cpu")
         self.layer_num = layer_num
+        self.head_num = 1
+        self.head_dim = 1
+        self.store_dtype = torch.float32
         self.cpu_offloading_chunk_size = cpu_offloading_chunk_size
 
 
@@ -38,6 +41,8 @@ class FakeAllocator:
         self.v_buffers = [
             torch.zeros((size + 1, 1, 1), dtype=torch.float32) for _ in range(layer_num)
         ]
+        self._kvcache.k_buffer = self.k_buffers
+        self._kvcache.v_buffer = self.v_buffers
         self.freed = []
 
     def get_kvcache(self):
@@ -117,17 +122,20 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache = self._new_cache()
 
     def tearDown(self):
+        self.cache._stop_restore_backend()
         self.cache._stop_async_backend()
+        self.cache._close_arena()
+        self.cache.profiler.close()
         self.tmpdir.cleanup()
 
-    def _new_cache(self, page_size=1, max_pending_writes=8):
+    def _new_cache(self, page_size=1, max_pending_writes=8, l3_budget_gb=0.01):
         return UnifiedRadixCache(
             req_to_token_pool=self.req_pool,
             token_to_kv_pool_allocator=self.allocator,
             page_size=page_size,
             l3_dir=self.tmpdir.name,
-            l3_budget_gb=0.01,
-            l3_block_size=64,
+            l3_budget_gb=l3_budget_gb,
+            l3_block_size=4096,
             max_pending_writes=max_pending_writes,
         )
 
@@ -171,15 +179,22 @@ class TestUnifiedRadixCache(unittest.TestCase):
     def _install_blocking_writer(self):
         started = threading.Event()
         release = threading.Event()
-        original = self.cache._write_l3_entry_from_cpu
+        original = self.cache._write_l3_entry_from_device
 
         def blocking_writer(*args, **kwargs):
             started.set()
             self.assertTrue(release.wait(timeout=3.0))
             return original(*args, **kwargs)
 
-        self.cache._write_l3_entry_from_cpu = blocking_writer
+        self.cache._write_l3_entry_from_device = blocking_writer
         return started, release
+
+    def _wait_for_writer_started(self, started, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while not started.is_set() and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+        self.assertTrue(started.is_set())
 
     def _assert_dram_residency_is_prefix_closed(self):
         stack = [(self.cache.root_node, False)]
@@ -267,12 +282,18 @@ class TestUnifiedRadixCache(unittest.TestCase):
         indices = self.allocator.alloc(2)
         self.allocator.fill(indices, 20)
 
-        prefix_len = self.cache.insert(
-            RadixKey([1, 2]), indices, chunked=False
-        )
+        prefix_len = self.cache.insert(RadixKey([1, 2]), indices, chunked=False)
 
         self.assertEqual(prefix_len, 2)
         self.assertIn(node.id, self.cache._ongoing_writes)
+        # A queued descriptor must not add a cache lock. The scheduler only
+        # locks it once the worker is ready to snapshot the device value.
+        self.assertEqual(node.lock_ref, 1)
+        deadline = time.monotonic() + 1.0
+        while not self.cache._ongoing_writes[node.id].active:
+            self.cache.check_hicache_events()
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
         self.assertEqual(node.lock_ref, 2)
         self.allocator.free(indices[:prefix_len])
         self.cache.dec_lock_ref(node)
@@ -286,7 +307,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         begin = time.perf_counter()
         self.assertTrue(self.cache._submit_async_write(node, "insert-trigger"))
         self.assertLess(time.perf_counter() - begin, 0.1)
-        self.assertTrue(started.wait(timeout=1.0))
+        self._wait_for_writer_started(started)
         self.assertIsNotNone(node.value)
 
         release.set()
@@ -308,7 +329,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         started, release = self._install_blocking_writer()
 
         self._insert([1, 2, 3, 4, 5, 6], base=40, chunked=False)
-        self.assertTrue(started.wait(timeout=1.0))
+        self._wait_for_writer_started(started)
         self.assertEqual(list(self.cache._ongoing_writes), [parent.id, middle.id])
         self.assertNotIn(leaf.id, self.cache._ongoing_writes)
         self.assertEqual(self.cache.stats.async_backpressure_skipped, 1)
@@ -325,7 +346,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         def fail_snapshot(_indices):
             raise RuntimeError("injected snapshot failure")
 
-        self.allocator.get_cpu_copy = fail_snapshot
+        self.cache._write_buffers[0].snapshot = fail_snapshot
         self.assertTrue(self.cache._submit_async_write(node, "insert-trigger"))
         self._wait_for_async()
         self.assertIn(node, self.cache.root_node.children.values())
@@ -360,7 +381,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         node = self._insert([1, 2, 3, 4])
         started, release = self._install_blocking_writer()
         self.cache._submit_async_write(node, "insert-trigger")
-        self.assertTrue(started.wait(timeout=1.0))
+        self._wait_for_writer_started(started)
 
         self.cache.match_prefix(RadixKey([1, 2]))
         release.set()
@@ -408,7 +429,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         child = self._only_child(parent)
         self.cache._submit_async_write(child, "insert-trigger")
         self._wait_for_async()
-        child_file_path = child.l3_entry.file_path
+        child_slots = list(child.l3_entry.slots)
 
         self.cache.evict(2)
         self.assertTrue(child.evicted)
@@ -417,7 +438,9 @@ class TestUnifiedRadixCache(unittest.TestCase):
 
         self.assertEqual(len(self.cache.root_node.children), 0)
         self.assertEqual(len(self.cache.l3_entries), 0)
-        self.assertFalse(os.path.exists(child_file_path))
+        self.assertTrue(
+            all(not self.cache._arena.is_current(slot) for slot in child_slots)
+        )
 
     def test_evict_uses_heap_and_promotes_parent(self):
         self._insert([1, 2], base=10)
@@ -452,7 +475,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         victim = self._insert([5, 6, 7, 8], base=20)
         started, release = self._install_blocking_writer()
         self.cache._submit_async_write(pending, "insert-trigger")
-        self.assertTrue(started.wait(timeout=1.0))
+        self._wait_for_writer_started(started)
         submitted_before = self.cache.stats.async_submitted
 
         begin = time.perf_counter()
@@ -482,7 +505,8 @@ class TestUnifiedRadixCache(unittest.TestCase):
         parent, child = self._prepare_evicted_parent_with_child()
         old_parent_id = parent.id
         old_parent_entry = parent.l3_entry
-        old_file_path = old_parent_entry.file_path
+        old_slots = list(old_parent_entry.slots)
+        writes_before = self.cache.stats.write_count
 
         result = self.cache.match_prefix(RadixKey([1, 2, 3, 9]))
 
@@ -496,8 +520,12 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertTrue(prefix.evicted)
         self.assertTrue(tail.evicted)
         self.assertTrue(child.evicted)
-        self.assertFalse(os.path.exists(old_file_path))
         self.assertIsNot(self.cache.l3_entries[old_parent_id], old_parent_entry)
+        self.assertEqual(
+            prefix.l3_entry.slots + tail.l3_entry.slots,
+            old_slots,
+        )
+        self.assertEqual(self.cache.stats.write_count, writes_before)
 
     def test_partial_split_tail_restores(self):
         self._prepare_evicted_parent_with_child()
@@ -517,6 +545,37 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(child.evicted)
         self._assert_dram_residency_is_prefix_closed()
 
+    def test_async_restore_coalesces_waiters_and_commits_off_scheduler(self):
+        parent, child = self._prepare_evicted_parent_with_child()
+
+        first = self.cache.match_prefix(
+            RadixKey(list(range(1, 9))), rid="restore-first"
+        )
+        second = self.cache.match_prefix(
+            RadixKey(list(range(1, 9))), rid="restore-second"
+        )
+
+        self.assertEqual(first.host_hit_length, 8)
+        self.assertEqual(second.host_hit_length, 8)
+        self.assertEqual(len(self.cache._restore_by_path), 1)
+        operation = next(iter(self.cache._restore_by_path.values()))
+        self.assertEqual(operation.waiter_rids, {"restore-first", "restore-second"})
+        self.assertFalse(self.cache.check_restore_progress("restore-first"))
+
+        deadline = time.monotonic() + 3.0
+        while self.cache._restore_by_path and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertTrue(self.cache.check_restore_progress("restore-first"))
+        self.assertTrue(self.cache.check_restore_progress("restore-second"))
+        self.assertFalse(parent.evicted)
+        self.assertFalse(child.evicted)
+        self.assertEqual(self.cache.stats.read_count, 1)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self._assert_dram_residency_is_prefix_closed()
+
     def test_clear_removes_l3_only_subtree_and_restarts_worker(self):
         node = self._insert([1, 2, 3, 4])
         self.cache._submit_async_write(node, "insert-trigger")
@@ -533,7 +592,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         node = self._insert([1, 2, 3, 4])
         started, release = self._install_blocking_writer()
         self.cache._submit_async_write(node, "insert-trigger")
-        self.assertTrue(started.wait(timeout=1.0))
+        self._wait_for_writer_started(started)
         timer = threading.Timer(0.05, release.set)
         timer.start()
 
@@ -547,10 +606,12 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertEqual(list(self.cache.l3_run_dir.glob("*.tmp")), [])
 
     def test_l3_budget_evicts_old_resident_backup(self):
+        self.cache._stop_async_backend()
+        self.cache._close_arena()
+        self.cache = self._new_cache(l3_budget_gb=(4 * 4096) / (1024**3))
         first = self._insert([1, 2, 3, 4], base=10)
         self.cache._submit_async_write(first, "insert-trigger")
         self._wait_for_async()
-        self.cache.l3_budget_bytes = first.l3_entry.nbytes
 
         second = self._insert([5, 6, 7, 8], base=20)
         self.cache._submit_async_write(second, "insert-trigger")
@@ -578,6 +639,17 @@ class TestUnifiedRadixCache(unittest.TestCase):
             option_strings,
         )
         self.assertNotIn("--unified-radix-cache-write-backend", option_strings)
+
+    def test_unified_cache_rejects_multi_device_topologies(self):
+        for field_name in ("tp_size", "pp_size", "dp_size"):
+            with self.subTest(field_name=field_name):
+                args = ServerArgs(
+                    model_path="dummy",
+                    enable_unified_radix_cache=True,
+                    **{field_name: 2},
+                )
+                with self.assertRaisesRegex(ValueError, "exactly one device"):
+                    args._handle_cache_compatibility()
 
 
 if __name__ == "__main__":

@@ -746,6 +746,7 @@ class Scheduler(
                     eviction_policy=server_args.radix_eviction_policy,
                     max_pending_writes=server_args.unified_radix_cache_max_pending_writes,
                     debug=server_args.unified_radix_cache_debug,
+                    profile_path=server_args.unified_radix_cache_profile_path,
                     tp_cache_group=self.tp_cpu_group,
                     is_eagle=self.spec_algorithm.is_eagle(),
                     tp_rank=self.tp_rank,
@@ -1366,6 +1367,10 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        if self.enable_unified_radix_cache:
+            # Unified L3 restore starts at admission so SSD reads and CUDA
+            # refill overlap queueing instead of blocking PrefillAdder.
+            req.init_next_round_input(self.tree_cache)
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
@@ -1600,7 +1605,19 @@ class Scheduler(
         # UnifiedRadixCache uses a single-result handoff to keep temporary L3
         # usage bounded, so acknowledge completed writes on every scheduler turn.
         if self.enable_unified_radix_cache:
-            self.tree_cache.check_hicache_events()
+            self.tree_cache.profile_event(
+                "scheduler_tick",
+                running_reqs=len(self.running_batch.reqs),
+                waiting_reqs=len(self.waiting_queue),
+            )
+            self.tree_cache.check_hicache_events(
+                allow_restore_allocation=self.chunked_req is None
+            )
+            if self.waiting_queue:
+                # Restore completion changes allocator/cache capacity without a
+                # model batch completing. Re-open prefill admission so queued
+                # requests can acknowledge restored prefixes and make progress.
+                self.running_batch.batch_is_full = False
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1758,8 +1775,51 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+            if self.enable_unified_radix_cache:
+                restore_done = self.tree_cache.check_restore_progress(req.rid)
+                if not restore_done:
+                    # L3 read/refill runs on its own worker and CUDA stream.
+                    continue
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_unified_radix_cache:
+                restore_pending = False
+                # A restore can complete between match_prefix() and this
+                # progress check. In that case the request still carries the
+                # old host_hit_length, so rematch until its snapshot reflects
+                # the committed device prefix.
+                for _ in range(3):
+                    if req.host_hit_length <= 0:
+                        break
+                    if not self.tree_cache.check_restore_progress(req.rid):
+                        restore_pending = True
+                        break
+                    req.init_next_round_input(self.tree_cache)
+                else:
+                    restore_pending = req.host_hit_length > 0
+                if restore_pending:
+                    continue
+                max_prefix_len = max(len(req.fill_ids) - 1, 0)
+                if (
+                    len(req.prefix_indices) > max_prefix_len
+                    or req.extend_input_len < 0
+                    or req.host_hit_length > req.extend_input_len
+                ):
+                    self.tree_cache.profile_event(
+                        "invalid_prefix_match",
+                        rid=req.rid,
+                        fill_tokens=len(req.fill_ids),
+                        prefix_tokens=len(req.prefix_indices),
+                        host_hit_tokens=req.host_hit_length,
+                        extend_tokens=req.extend_input_len,
+                        last_node_id=getattr(req.last_node, "id", None),
+                    )
+                    req.prefix_indices = req.prefix_indices[:0]
+                    req.last_node = self.tree_cache.root_node
+                    req.last_host_node = self.tree_cache.root_node
+                    req.host_hit_length = 0
+                    req.last_matched_prefix_len = 0
+                    req.extend_input_len = len(req.fill_ids)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2502,7 +2562,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_unified_radix_cache:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
