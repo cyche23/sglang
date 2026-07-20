@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import os
 import queue
@@ -194,7 +195,7 @@ class UnifiedRadixCache(RadixCache):
     """A Jetson-oriented two-tier radix cache: unified DRAM plus L3 SSD.
 
     This baseline intentionally avoids modeling CPU host memory as a separate
-    cache tier. Finished MHA KV segments are written through to SSD by a
+    cache tier. Non-chunked MHA KV insertions are written through to SSD by a
     single-worker asynchronous backend. Writes are best effort under queue
     backpressure. Restores and partial L3 node splits remain synchronous.
     """
@@ -414,12 +415,17 @@ class UnifiedRadixCache(RadixCache):
             stack.extend(child.children.values())
         return False
 
-    def _submit_async_write(self, node: TreeNode, reason: str) -> bool:
+    def _submit_async_write(
+        self,
+        node: TreeNode,
+        reason: str,
+        allow_external_lock: bool = False,
+    ) -> bool:
         if self._async_backend is None or node.value is None or node.evicted:
             return False
         if node.id in self._ongoing_writes:
             return False
-        if self._has_external_lock(node):
+        if not allow_external_lock and self._has_external_lock(node):
             self._log_info(
                 "UnifiedRadixCache async L3 write skipped: node_id=%s, "
                 "reason=%s, external_lock_ref=%d",
@@ -591,18 +597,6 @@ class UnifiedRadixCache(RadixCache):
             if block:
                 break
 
-    def cache_finished_req(self, req, is_insert: bool = True):
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
-        page_aligned_len = all_token_len // self.page_size * self.page_size
-        page_aligned_token_ids = token_ids[:page_aligned_len]
-        extra_key = req.extra_key
-
-        super().cache_finished_req(req, is_insert=is_insert)
-
-        if is_insert and page_aligned_len > 0:
-            self._backup_exact_prefix(page_aligned_token_ids, extra_key)
-
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key.token_ids = self.key_convert_fn(key.token_ids)
@@ -685,6 +679,7 @@ class UnifiedRadixCache(RadixCache):
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+        insert_path: List[TreeNode] = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -705,6 +700,8 @@ class UnifiedRadixCache(RadixCache):
                         child.id,
                         split_status,
                     )
+                    if not chunked:
+                        self._submit_insert_path(insert_path)
                     return total_prefix_length
                 child = split_node
 
@@ -719,6 +716,7 @@ class UnifiedRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
                 total_prefix_length += prefix_len
+            insert_path.append(node)
 
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -733,23 +731,47 @@ class UnifiedRadixCache(RadixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
+            insert_path.append(new_node)
+
+        if not chunked:
+            self._submit_insert_path(insert_path)
 
         return total_prefix_length
+
+    def _submit_insert_path(self, insert_path: List[TreeNode]) -> None:
+        # The path is collected by insert in root-to-leaf order. Reuse it to
+        # avoid a second radix-tree traversal after the insertion completes.
+        for node in insert_path:
+            if (
+                node.parent is not None
+                and node.parent.children.get(self.get_child_key_fn(node.key)) is node
+                and not node.evicted
+                and not self._has_l3_entry(node)
+            ):
+                self._submit_async_write(
+                    node,
+                    reason="insert-trigger",
+                    allow_external_lock=True,
+                )
 
     def evict(self, num_tokens: int):
         if self.disable:
             return
 
-        # Make already completed finish-trigger writes visible, but never wait
+        # Make already completed insert-trigger writes visible, but never wait
         # for or submit L3 I/O from the memory-pressure path.
         self._drain_async_results(block=False)
 
         leaves = self._collect_leaves_device()
-        leaves.sort(key=lambda n: self.eviction_strategy.get_priority(n))
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node.id, node)
+            for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
 
         num_evicted = 0
-        while num_evicted < num_tokens and leaves:
-            node = leaves.pop(0)
+        while num_evicted < num_tokens and eviction_heap:
+            _priority, _node_id, node = heapq.heappop(eviction_heap)
             if node == self.root_node or node.lock_ref > 0 or node.evicted:
                 continue
 
@@ -769,8 +791,14 @@ class UnifiedRadixCache(RadixCache):
                 and parent.lock_ref == 0
                 and all(child.evicted for child in parent.children.values())
             ):
-                leaves.append(parent)
-                leaves.sort(key=lambda n: self.eviction_strategy.get_priority(n))
+                heapq.heappush(
+                    eviction_heap,
+                    (
+                        self.eviction_strategy.get_priority(parent),
+                        parent.id,
+                        parent,
+                    ),
+                )
 
         self._log_info(
             "UnifiedRadixCache pressure eviction finished: policy=write-through, "
@@ -1084,23 +1112,6 @@ class UnifiedRadixCache(RadixCache):
             self.stats.used_bytes,
         )
         return new_node, "success"
-
-    def _backup_exact_prefix(self, token_ids: List[int], extra_key: Optional[str]):
-        if not token_ids:
-            return
-        result = self.match_prefix(RadixKey(token_ids=token_ids, extra_key=extra_key))
-        node = result.last_device_node
-        if node == self.root_node or node.evicted:
-            return
-        path = []
-        while node != self.root_node:
-            path.append(node)
-            node = node.parent
-        # Preserve an independently restorable L3 prefix under backpressure by
-        # submitting shared ancestors before request-specific suffix nodes.
-        for path_node in reversed(path):
-            if not path_node.evicted and not self._has_l3_entry(path_node):
-                self._submit_async_write(path_node, reason="finish-trigger")
 
     def _release_dram_copy(self, node: TreeNode, reason: str) -> int:
         if node.value is None:

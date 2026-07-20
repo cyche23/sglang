@@ -2,8 +2,8 @@
 
 This baseline is an experimental Jetson-oriented KV cache path for SGLang
 v0.5.4. It treats GPU/CPU unified memory as one DRAM tier and adds an L3 SSD
-tier behind the radix cache. Finished KV is written through to L3 by a bounded,
-single-worker asynchronous backend.
+tier behind the radix cache. Non-chunked KV insertions are written through to
+L3 by a bounded, single-worker asynchronous backend.
 
 ## Scope
 
@@ -15,16 +15,19 @@ single-worker asynchronous backend.
   `--unified-radix-cache-l3-dir` and keeps metadata in memory only.
 - L3 files are raw per-entry files. Metadata tracks node id, token/page count,
   dtype, shape, byte offsets, and aligned file size.
-- Every non-empty page-aligned finished request attempts DRAM-to-SSD
-  write-through. The background worker performs the CPU snapshot and raw-file
-  write, then the scheduler thread commits radix metadata. Successful writes
-  retain the DRAM copy.
+- Every non-empty, non-chunked insertion attempts DRAM-to-SSD write-through.
+  Finished requests use this path after page alignment, while chunked prefill
+  insertions skip it. The background worker performs the CPU snapshot and
+  raw-file write, then the scheduler thread commits radix metadata. Successful
+  writes retain the DRAM copy.
 - L3 restore and partial-node split I/O remain synchronous. There is no prefetch,
   Mooncake, HF3FS, NIXL, or remote KV backend in this baseline.
-- Async writes are protected by radix reference locks. The queue is bounded and
-  a full finish-trigger queue skips the write without blocking the request.
+- Async writes are protected by radix reference locks. Insert-trigger writes may
+  coexist with the current request lock and add their own tracked lock. The
+  queue is bounded, and a full queue skips the write without blocking the
+  insertion.
 - DRAM residency is prefix-closed: an L3-only node cannot have a DRAM-resident
-  descendant. Finish-trigger submits ancestors before suffix nodes. Pressure
+  descendant. Insert-trigger submits ancestors before suffix nodes. Pressure
   eviction releases backed device leaves and drops unbacked leaves without
   submitting or waiting for L3 I/O.
 
@@ -109,7 +112,7 @@ authoritative source for L3 byte counters and restore latency.
   the budget is enforced before that file is committed as a cache entry.
 - Memory-pressure eviction never waits for pending writes. Pending nodes are
   lock-protected and skipped, so `evict()` may release fewer tokens than
-  requested when all candidates have an active finish-trigger write.
+  requested when all candidates have an active insert-trigger write.
 - Backpressure, write failure, or L3 budget eviction can leave a node without a
   backup. Memory pressure drops such an unlocked leaf and later requests
   recompute it.
