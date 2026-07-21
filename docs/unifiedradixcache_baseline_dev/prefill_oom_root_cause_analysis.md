@@ -218,3 +218,49 @@ UnifiedRadixCache 固定使用 async backend。`--unified-radix-cache-offload-af
 ### 端到端验证
 
 端到端结果使用相同模型、40960 KV tokens、page size 64、arrival rate 0.02、20 trace instances、seed 42，对比 async UnifiedRadixCache 与 disabled。验收时同时检查：所有请求状态、OOM/scheduler exception、只存在 finish-trigger 新 KV 写入、pressure eviction 没有写盘，以及后续 L3 restore 日志。
+
+## 2026-07-20：异步 restore anchor 竞态
+
+### 新复现与根因
+
+在 `f8bd15349b` 上使用 10 个并发 agent trace、arrival rate 1 和 page size 64 时，finish-trigger 修复后的实现仍可稳定触发 prefill OOM：
+
+- 用户实验在 13:49:33 失败，allocator 仅剩 448 tokens，但 `evictable_size=9600`；树中 51456 个 device-visible tokens 全部带锁，账面可淘汰容量无法兑现。
+- 带 debug/profile 的同参数复现在 14:05:29 失败，OOM 前出现 `DRAM release skipped ... resident_descendant=True`，直接证明 L3-only ancestor 下再次出现 resident descendant。
+- 两次请求日志均有 513 条；服务退出后其余请求转为 connection-refused，故障边界应以 server 的 scheduler exception 为准。
+
+第二个 mixed-tier hole 来自异步 restore 生命周期，而不是 finish-trigger：
+
+1. restore operation 记录一段连续 L3-only suffix，并在最近的 resident ancestor（anchor）下分配 device slots。
+2. 旧实现只在 allocation 调用期间临时增加 anchor 的 radix lock，提交给 restore worker 后立即释放。
+3. SSD read/CUDA refill 进行期间，pressure eviction 可以把未锁定的 anchor 释放到 L3。
+4. restore completion 只检查 source nodes 和 L3 slots 是否仍有效，没有检查 anchor 是否仍 resident，因而把 suffix 提交回 DRAM。
+5. 结果同时破坏 prefix-closed topology 和 lock/accounting：对 L3-only ancestor 执行 `inc_lock_ref()` / `dec_lock_ref()` 会把从未计入 resident cache 的 key 长度错误加入或移出 `evictable_size_`。
+
+### 修复
+
+- restore operation 显式保存 anchor；启动前验证 anchor resident、仍连接 radix root，且 source nodes 仍是从 anchor 开始的连续 parent-child path。
+- 成功分配 restore slots 后持续持有 anchor lock，覆盖 worker I/O 和 scheduler result commit。
+- commit 时先安装 restored values，再获取 terminal completion lock，最后释放 anchor lock，使保护无窗口地从 anchor 转交给 terminal。
+- allocation/submit/read/stale/reset/clear/shutdown 等失败路径通过幂等清理释放 restore slots 和 anchor lock。
+- 已提交 operation 的全部 waiter 若 abort，worker 安全结束后丢弃结果，不再创建无人释放的 completion lock。
+- debug 模式在 cache-event 和 pressure-eviction 边界重算 prefix-closed、evictable/protected counters 和 device-index ownership；生产路径不增加整树遍历。
+
+### 新增回归
+
+单元测试新增覆盖：restore I/O 期间的 pressure eviction、allocation 前 anchor 已淘汰、anchor-to-terminal lock transfer、唯一 waiter abort、read/submit failure、active restore reset，以及 page size 64 的 restore-evict-alloc 守恒。
+
+### Debug 压测发现的相邻页所有权问题
+
+anchor 修复后的首轮 debug 压测越过了原稳定 OOM 窗口，但整树 device-index 校验在后续 batch 捕获到两个 resident node 共同持有 index 640。对应日志显示，chunked request 的 insert 在部分 L3 node 上遇到并发 restore，返回 `restore-inflight` 后进入提前退出路径。
+
+该路径原本无条件调用 `_free_uninserted_value(value)`。对 finished request 这是正确清理；但 chunked request 会继续执行，并继续通过 `req.prefix_indices` 持有这些 KV indices。paged allocator 将整页归还后，该页会被分配给其他请求，原请求随后又可能把同一页插入 radix tree，最终形成重复物理页所有权并再次造成容量失配。
+
+修复限定为 UnifiedRadixCache 内部：partial split 因非读取错误提前退出时，仅 non-chunked insert 释放未插入 value；chunked insert 保留仍由请求拥有的页。新增 page size 64 回归，强制 `restore-inflight` partial split，并验证 allocator 可用量和 free 记录均不变化。
+
+### 最终验证结果
+
+- 单元测试：UnifiedRadixCache 33 项全部通过，其中包含 restore anchor 生命周期、失败/abort/reset 清理、page size 64 守恒和 chunked `restore-inflight` 页所有权回归。
+- I/O 测试：5 项全部通过；目标文件通过 Python 编译、pre-commit hooks 和 `git diff --check`。
+- debug/profile 复现：严格使用 10 instances、arrival rate 1、seed 42 和 page size 64，513/513 请求 `status=ok` 且 HTTP 200；完整运行中未触发 mixed-tier、counter 或 device-index ownership 断言。
+- 生产参数复现：关闭 debug/profile 后按用户命令完整运行，513/513 请求 `status=ok` 且 HTTP 200；server 日志没有 prefill OOM、scheduler exception、resident-descendant release warning 或 restore/lock cleanup error，loader 日志没有连接拒绝或请求异常。

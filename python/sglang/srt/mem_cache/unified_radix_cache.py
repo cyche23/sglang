@@ -104,6 +104,7 @@ class L3RestoreOperation:
     sequence_id: int
     generation: int
     terminal_node: TreeNode
+    anchor_node: TreeNode
     source_nodes: List[tuple[TreeNode, L3Entry]]
     token_count: int
     submitted_at: float
@@ -111,6 +112,7 @@ class L3RestoreOperation:
     device_indices: Optional[torch.Tensor] = None
     restore_nodes: List[L3RestoreNode] = field(default_factory=list)
     state: str = "allocating"
+    anchor_lock_held: bool = False
     completion_lock_held: bool = False
 
     @property
@@ -544,6 +546,20 @@ class UnifiedRadixCache(RadixCache):
         self.token_to_kv_pool_allocator.free(operation.device_indices)
         operation.device_indices = None
 
+    def _release_restore_anchor_lock(self, operation: L3RestoreOperation):
+        if not operation.anchor_lock_held:
+            return
+        if self._is_node_attached(operation.anchor_node):
+            self.dec_lock_ref(operation.anchor_node)
+        else:
+            logger.error(
+                "UnifiedRadixCache restore anchor detached while locked: "
+                "operation_id=%s, anchor_node_id=%s",
+                operation.sequence_id,
+                operation.anchor_node.id,
+            )
+        operation.anchor_lock_held = False
+
     def _stop_restore_backend(self):
         self._restore_generation += 1
         backend = self._restore_backend
@@ -551,6 +567,7 @@ class UnifiedRadixCache(RadixCache):
             backend.shutdown()
         for operation in list(self._restore_by_path.values()):
             self._free_restore_device_indices(operation)
+            self._release_restore_anchor_lock(operation)
             self._release_restore_operation(operation)
         completed_operations = {
             id(operation): operation
@@ -739,6 +756,7 @@ class UnifiedRadixCache(RadixCache):
             sequence_id=self._restore_sequence,
             generation=self._restore_generation,
             terminal_node=last_host_node,
+            anchor_node=node,
             source_nodes=source_nodes,
             token_count=sum(len(source_node.key) for source_node, _ in source_nodes),
             submitted_at=time.monotonic(),
@@ -766,17 +784,22 @@ class UnifiedRadixCache(RadixCache):
         if (
             operation.generation != self._restore_generation
             or self._restore_by_path.get(operation.path_key) is not operation
+            or not self._is_node_attached(operation.anchor_node)
+            or operation.anchor_node.evicted
         ):
             return False
+        parent = operation.anchor_node
         for node, entry in operation.source_nodes:
             if (
                 not self._is_node_attached(node)
+                or node.parent is not parent
                 or self._get_l3_entry(node) is not entry
                 or (require_evicted and not node.evicted)
                 or self._arena is None
                 or any(not self._arena.is_current(slot) for slot in entry.slots)
             ):
                 return False
+            parent = node
         return True
 
     def _try_start_pending_restore(self) -> bool:
@@ -797,16 +820,16 @@ class UnifiedRadixCache(RadixCache):
             self._finish_restore_without_commit(operation, "stale before allocation")
             return True
 
-        ancestor_node = operation.source_nodes[0][0].parent
-        self.inc_lock_ref(ancestor_node)
+        self.inc_lock_ref(operation.anchor_node)
+        operation.anchor_lock_held = True
         device_indices = self.token_to_kv_pool_allocator.alloc(operation.token_count)
         if device_indices is None:
             self.evict(operation.token_count)
             device_indices = self.token_to_kv_pool_allocator.alloc(
                 operation.token_count
             )
-        self.dec_lock_ref(ancestor_node)
         if device_indices is None:
+            self._release_restore_anchor_lock(operation)
             self.profile_event(
                 "restore_allocation_wait",
                 operation_id=operation.sequence_id,
@@ -839,6 +862,7 @@ class UnifiedRadixCache(RadixCache):
             operation.state = "allocating"
             operation.restore_nodes = []
             self._free_restore_device_indices(operation)
+            self._release_restore_anchor_lock(operation)
             return False
 
         self.profile_event(
@@ -854,6 +878,7 @@ class UnifiedRadixCache(RadixCache):
     def _finish_restore_without_commit(self, operation: L3RestoreOperation, error: str):
         waiters = set(operation.waiter_rids)
         self._free_restore_device_indices(operation)
+        self._release_restore_anchor_lock(operation)
         self._release_restore_operation(operation)
         for rid in waiters:
             self._completed_restore_rids[rid] = None
@@ -883,6 +908,12 @@ class UnifiedRadixCache(RadixCache):
                         self._drop_subtree(first_node, reason="stale-l3-read-failure")
                 continue
 
+            if not operation.waiter_rids:
+                self._finish_restore_without_commit(
+                    operation, "all waiters aborted during restore"
+                )
+                continue
+
             offset = 0
             restored_bytes = 0
             for restore_node in operation.restore_nodes:
@@ -897,6 +928,7 @@ class UnifiedRadixCache(RadixCache):
             self.protected_size_ -= operation.token_count
             self.inc_lock_ref(operation.terminal_node)
             operation.completion_lock_held = True
+            self._release_restore_anchor_lock(operation)
             operation.state = "committed"
             self._release_restore_operation(operation)
             for rid in waiters:
@@ -995,6 +1027,79 @@ class UnifiedRadixCache(RadixCache):
             # holes left by an older implementation.
             stack.extend(child.children.values())
         return False
+
+    def _debug_validate_invariants(self, context: str):
+        if not self.debug:
+            return
+
+        resident_evictable = 0
+        resident_protected = 0
+        resident_values = []
+        stack = [(self.root_node, False)]
+        while stack:
+            node, has_evicted_ancestor = stack.pop()
+            if node != self.root_node:
+                if not node.evicted:
+                    if has_evicted_ancestor:
+                        raise AssertionError(
+                            "UnifiedRadixCache DRAM residency is not prefix-closed: "
+                            f"context={context}, node_id={node.id}"
+                        )
+                    resident_values.append((f"node:{node.id}", node.value))
+                    if node.lock_ref == 0:
+                        resident_evictable += len(node.value)
+                    else:
+                        resident_protected += len(node.value)
+                elif node.lock_ref != 0:
+                    raise AssertionError(
+                        "UnifiedRadixCache L3-only node is locked: "
+                        f"context={context}, node_id={node.id}, "
+                        f"lock_ref={node.lock_ref}"
+                    )
+            next_has_evicted_ancestor = has_evicted_ancestor or (
+                node != self.root_node and node.evicted
+            )
+            stack.extend(
+                (child, next_has_evicted_ancestor) for child in node.children.values()
+            )
+
+        pending_restore_tokens = 0
+        pending_values = []
+        seen_operations = set()
+        for operation in self._restore_by_path.values():
+            if id(operation) in seen_operations or operation.device_indices is None:
+                continue
+            seen_operations.add(id(operation))
+            pending_restore_tokens += len(operation.device_indices)
+            pending_values.append(
+                (f"restore:{operation.sequence_id}", operation.device_indices)
+            )
+
+        if resident_evictable != self.evictable_size_:
+            raise AssertionError(
+                "UnifiedRadixCache evictable accounting mismatch: "
+                f"context={context}, tree={resident_evictable}, "
+                f"counter={self.evictable_size_}"
+            )
+        expected_protected = resident_protected + pending_restore_tokens
+        if expected_protected != self.protected_size_:
+            raise AssertionError(
+                "UnifiedRadixCache protected accounting mismatch: "
+                f"context={context}, tree={resident_protected}, "
+                f"pending_restore={pending_restore_tokens}, "
+                f"counter={self.protected_size_}"
+            )
+
+        seen_indices = {}
+        for owner, value in resident_values + pending_values:
+            for index in value.detach().to(device="cpu", dtype=torch.int64).tolist():
+                previous_owner = seen_indices.setdefault(index, owner)
+                if previous_owner != owner:
+                    raise AssertionError(
+                        "UnifiedRadixCache device index has multiple owners: "
+                        f"context={context}, index={index}, "
+                        f"owners=({previous_owner}, {owner})"
+                    )
 
     def _submit_async_write(
         self,
@@ -1348,7 +1453,14 @@ class UnifiedRadixCache(RadixCache):
                 if split_node is None:
                     if split_status in ("read-failure", "missing-entry"):
                         break
-                    self._free_uninserted_value(value)
+                    # A chunked request still owns and will reuse the KV pages
+                    # that could not be inserted. Freeing them here lets the
+                    # paged allocator hand the same physical page to another
+                    # request while the chunked request continues to reference
+                    # it. A finished/non-chunked insertion has no future owner,
+                    # so its uninserted suffix must still be released.
+                    if not chunked:
+                        self._free_uninserted_value(value)
                     self._log_info(
                         "UnifiedRadixCache insert skipped after partial L3 split "
                         "failure: node_id=%s, status=%s, preserved_subtree=True",
@@ -1461,6 +1573,7 @@ class UnifiedRadixCache(RadixCache):
             num_tokens,
             num_evicted,
         )
+        self._debug_validate_invariants("pressure-eviction")
 
     def init_load_back(
         self,
@@ -1639,6 +1752,7 @@ class UnifiedRadixCache(RadixCache):
             for operation in self._completed_restore_rids.values()
         ):
             self._restore_demand.clear()
+        self._debug_validate_invariants("cache-events")
         return None
 
     def clear_storage_backend(self) -> bool:

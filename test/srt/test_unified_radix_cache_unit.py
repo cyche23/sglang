@@ -189,6 +189,19 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._write_l3_entry_from_device = blocking_writer
         return started, release
 
+    def _install_blocking_restore(self):
+        started = threading.Event()
+        release = threading.Event()
+        original = self.cache._restore_l3_entry
+
+        def blocking_restore(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return original(*args, **kwargs)
+
+        self.cache._restore_l3_entry = blocking_restore
+        return started, release
+
     def _wait_for_writer_started(self, started, timeout=1.0):
         deadline = time.monotonic() + timeout
         while not started.is_set() and time.monotonic() < deadline:
@@ -218,6 +231,19 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self._wait_for_async()
         self.cache.evict(8)
         self.assertTrue(parent.evicted)
+        self.assertTrue(child.evicted)
+        return parent, child
+
+    def _prepare_resident_anchor_with_evicted_child(self):
+        self._insert([1, 2], base=10)
+        self._insert([1, 2, 3, 4], base=20)
+        parent = self._only_child(self.cache.root_node)
+        child = self._only_child(parent)
+        self.assertTrue(self.cache._submit_async_write(parent, "insert-trigger"))
+        self.assertTrue(self.cache._submit_async_write(child, "insert-trigger"))
+        self._wait_for_async()
+        self.cache.evict(2)
+        self.assertFalse(parent.evicted)
         self.assertTrue(child.evicted)
         return parent, child
 
@@ -376,6 +402,43 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertIn(parent.id, self.cache._ongoing_writes)
         self._wait_for_async()
         self.assertIsNotNone(parent.l3_entry)
+
+    def test_chunked_partial_insert_restore_inflight_keeps_request_pages(self):
+        self.cache._stop_restore_backend()
+        self.cache._stop_async_backend()
+        self.cache._close_arena()
+        self.allocator = FakeAllocator(size=512, chunk_size=64)
+        self.cache = self._new_cache(page_size=64)
+        parent_tokens = list(range(64))
+        full_tokens = list(range(192))
+        self._insert(parent_tokens, base=10)
+        self._insert(full_tokens, base=20)
+        parent = self._only_child(self.cache.root_node)
+        child = self._only_child(parent)
+        self.assertTrue(self.cache._submit_async_write(child, "insert-trigger"))
+        self._wait_for_async()
+        self.cache.evict(128)
+        self.assertFalse(parent.evicted)
+        self.assertTrue(child.evicted)
+
+        request_tokens = list(range(128)) + list(range(1000, 1064))
+        request_indices = self.allocator.alloc(len(request_tokens))
+        available_before = self.allocator.available_size()
+        freed_before = len(self.allocator.freed)
+        self.cache._restoring_node_refs[child.id] = 1
+        try:
+            prefix_len = self.cache.insert(
+                RadixKey(request_tokens), request_indices, chunked=True
+            )
+        finally:
+            self.cache._restoring_node_refs.pop(child.id, None)
+
+        self.assertEqual(prefix_len, 64)
+        self.assertEqual(self.allocator.available_size(), available_before)
+        self.assertEqual(len(self.allocator.freed), freed_before)
+        self.assertFalse(
+            torch.isin(request_indices, self.allocator.free_pages).any().item()
+        )
 
     def test_split_during_write_discards_stale_result_and_retains_dram(self):
         node = self._insert([1, 2, 3, 4])
@@ -573,6 +636,196 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(parent.evicted)
         self.assertFalse(child.evicted)
         self.assertEqual(self.cache.stats.read_count, 1)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self._assert_dram_residency_is_prefix_closed()
+
+    def test_async_restore_holds_anchor_during_io_and_transfers_lock(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        self.cache.debug = True
+        started, release = self._install_blocking_restore()
+        available_before_restore = self.allocator.available_size()
+
+        result = self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        self.assertEqual(result.host_hit_length, 2)
+        self.cache.check_hicache_events()
+        self.assertTrue(started.wait(timeout=1.0))
+        operation = self.cache._restore_by_rid["restore"]
+        self.assertTrue(operation.anchor_lock_held)
+        self.assertEqual(parent.lock_ref, 1)
+        self.assertEqual(self.cache.protected_size(), 4)
+
+        self.cache.evict(2)
+        self.assertFalse(parent.evicted)
+        self.assertTrue(child.evicted)
+
+        release.set()
+        deadline = time.monotonic() + 3.0
+        while self.cache._restore_by_path and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertFalse(operation.anchor_lock_held)
+        self.assertTrue(operation.completion_lock_held)
+        self.assertEqual(parent.lock_ref, 1)
+        self.assertEqual(child.lock_ref, 1)
+
+        self.assertTrue(self.cache.check_restore_progress("restore"))
+        self.assertFalse(operation.completion_lock_held)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertEqual(child.lock_ref, 0)
+        self.assertEqual(self.cache.evictable_size(), 4)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.assertEqual(self.allocator.available_size(), available_before_restore - 2)
+        self.cache._debug_validate_invariants("unit-anchor-transfer")
+
+    def test_restore_rejects_anchor_evicted_before_allocation(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        self.cache.debug = True
+
+        result = self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        self.assertEqual(result.host_hit_length, 2)
+        operation = self.cache._restore_by_rid["restore"]
+        self.assertIs(operation.anchor_node, parent)
+        self.cache.evict(2)
+        self.assertTrue(parent.evicted)
+
+        self.assertTrue(self.cache._try_start_pending_restore())
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertFalse(operation.anchor_lock_held)
+        self.assertTrue(self.cache.check_restore_progress("restore"))
+
+        rematch = self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore-rematch")
+        self.assertEqual(rematch.host_hit_length, 4)
+        replacement = self.cache._restore_by_rid["restore-rematch"]
+        self.assertIs(replacement.anchor_node, self.cache.root_node)
+        self.assertEqual(
+            [node for node, _entry in replacement.source_nodes], [parent, child]
+        )
+        self.cache._debug_validate_invariants("unit-stale-anchor")
+
+    def test_aborted_submitted_restore_releases_anchor_and_device_slots(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        self.cache.debug = True
+        started, release = self._install_blocking_restore()
+        available_before_restore = self.allocator.available_size()
+
+        self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        self.cache.check_hicache_events()
+        self.assertTrue(started.wait(timeout=1.0))
+        operation = self.cache._restore_by_rid["restore"]
+        self.cache.release_aborted_request("restore")
+        self.assertFalse(operation.waiter_rids)
+        self.assertTrue(operation.anchor_lock_held)
+
+        release.set()
+        deadline = time.monotonic() + 3.0
+        while self.cache._restore_by_path and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertFalse(operation.anchor_lock_held)
+        self.assertFalse(operation.completion_lock_held)
+        self.assertFalse(parent.evicted)
+        self.assertTrue(child.evicted)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.assertEqual(self.allocator.available_size(), available_before_restore)
+        self.cache._debug_validate_invariants("unit-aborted-restore")
+
+    def test_restore_read_failure_releases_anchor_and_device_slots(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        self.cache.debug = True
+        available_before_restore = self.allocator.available_size()
+        self.cache._restore_l3_entry = mock.Mock(
+            side_effect=RuntimeError("injected restore failure")
+        )
+
+        self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        deadline = time.monotonic() + 3.0
+        while self.cache._restore_by_path and time.monotonic() < deadline:
+            self.cache.check_hicache_events()
+            time.sleep(0.005)
+
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertNotIn(child, parent.children.values())
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.assertEqual(self.allocator.available_size(), available_before_restore)
+        self.cache._debug_validate_invariants("unit-restore-failure")
+
+    def test_restore_submit_failure_releases_anchor_and_device_slots(self):
+        parent, _child = self._prepare_resident_anchor_with_evicted_child()
+        self.cache.debug = True
+        available_before_restore = self.allocator.available_size()
+        self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        operation = self.cache._restore_by_rid["restore"]
+
+        with mock.patch.object(
+            self.cache._restore_backend, "submit", return_value=False
+        ):
+            self.assertFalse(self.cache._try_start_pending_restore())
+
+        self.assertEqual(operation.state, "allocating")
+        self.assertIsNone(operation.device_indices)
+        self.assertFalse(operation.anchor_lock_held)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.assertEqual(self.allocator.available_size(), available_before_restore)
+        self.cache._debug_validate_invariants("unit-restore-submit-failure")
+
+    def test_reset_active_restore_releases_anchor_lock(self):
+        parent, _child = self._prepare_resident_anchor_with_evicted_child()
+        started, release = self._install_blocking_restore()
+        self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
+        self.cache.check_hicache_events()
+        self.assertTrue(started.wait(timeout=1.0))
+        operation = self.cache._restore_by_rid["restore"]
+        self.assertTrue(operation.anchor_lock_held)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+
+        self.cache.reset()
+        timer.join()
+
+        self.assertFalse(operation.anchor_lock_held)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertFalse(self.cache._restore_by_rid)
+        self.assertEqual(self.cache.protected_size(), 0)
+
+    def test_page_size_64_restore_evict_alloc_preserves_accounting(self):
+        self.cache._stop_restore_backend()
+        self.cache._stop_async_backend()
+        self.cache._close_arena()
+        self.allocator = FakeAllocator(size=192, chunk_size=64)
+        self.cache = self._new_cache(page_size=64)
+        self.cache.debug = True
+        parent_tokens = list(range(64))
+        full_tokens = list(range(128))
+        self._insert(parent_tokens, base=10)
+        self._insert(full_tokens, base=20)
+        parent = self._only_child(self.cache.root_node)
+        child = self._only_child(parent)
+        self.assertTrue(self.cache._submit_async_write(parent, "insert-trigger"))
+        self.assertTrue(self.cache._submit_async_write(child, "insert-trigger"))
+        self._wait_for_async()
+        self.cache.evict(64)
+        self.assertTrue(child.evicted)
+
+        self.cache.match_prefix(RadixKey(full_tokens), rid="restore")
+        deadline = time.monotonic() + 3.0
+        while not self.cache.check_restore_progress("restore"):
+            self.cache.check_hicache_events()
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        self.cache.check_hicache_events()
+        self.assertFalse(parent.evicted)
+        self.assertFalse(child.evicted)
+        self.cache.evict(64)
+        replacement = self.allocator.alloc(64)
+        self.assertIsNotNone(replacement)
+        self.assertEqual(len(replacement), 64)
+        self.assertEqual(self.cache.evictable_size(), 64)
         self.assertEqual(self.cache.protected_size(), 0)
         self._assert_dram_residency_is_prefix_closed()
 
