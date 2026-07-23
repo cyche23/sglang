@@ -392,6 +392,7 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
     enable_unified_radix_cache: bool = False
+    unified_radix_cache_async_restore_prefetch: bool = False
     unified_radix_cache_l3_dir: str = "/tmp/sglang-unified-radix-l3"
     unified_radix_cache_l3_budget_gb: float = 1.0
     unified_radix_cache_l3_block_size: int = 4096
@@ -1515,6 +1516,14 @@ class ServerArgs:
         if self.enable_unified_radix_cache and self.enable_lmcache:
             raise ValueError(
                 "The arguments enable-unified-radix-cache and enable-lmcache are mutually exclusive."
+            )
+        if (
+            self.unified_radix_cache_async_restore_prefetch
+            and not self.enable_unified_radix_cache
+        ):
+            raise ValueError(
+                "--unified-radix-cache-async-restore-prefetch requires "
+                "--enable-unified-radix-cache."
             )
         if self.enable_unified_radix_cache:
             if self.tp_size != 1 or self.pp_size != 1 or self.dp_size != 1:
@@ -2777,6 +2786,15 @@ class ServerArgs:
             "--enable-unified-radix-cache",
             action="store_true",
             help="Enable the experimental UnifiedRadixCache baseline for Jetson-style unified DRAM plus L3 SSD KV cache.",
+        )
+        parser.add_argument(
+            "--unified-radix-cache-async-restore-prefetch",
+            action="store_true",
+            help=(
+                "Enable the experimental match-time asynchronous L3 restore "
+                "prefetch path. Disabled by default; the default restore is "
+                "scheduler-led and synchronous."
+            ),
         )
         parser.add_argument(
             "--unified-radix-cache-l3-dir",

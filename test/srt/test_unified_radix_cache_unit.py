@@ -128,7 +128,13 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache.profiler.close()
         self.tmpdir.cleanup()
 
-    def _new_cache(self, page_size=1, max_pending_writes=8, l3_budget_gb=0.01):
+    def _new_cache(
+        self,
+        page_size=1,
+        max_pending_writes=8,
+        l3_budget_gb=0.01,
+        async_restore_prefetch=False,
+    ):
         return UnifiedRadixCache(
             req_to_token_pool=self.req_pool,
             token_to_kv_pool_allocator=self.allocator,
@@ -137,7 +143,12 @@ class TestUnifiedRadixCache(unittest.TestCase):
             l3_budget_gb=l3_budget_gb,
             l3_block_size=4096,
             max_pending_writes=max_pending_writes,
+            async_restore_prefetch=async_restore_prefetch,
         )
+
+    def _enable_async_restore_prefetch(self):
+        self.cache.async_restore_prefetch = True
+        self.cache._start_restore_backend()
 
     def _only_child(self, node):
         self.assertEqual(len(node.children), 1)
@@ -608,7 +619,103 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.assertFalse(child.evicted)
         self._assert_dram_residency_is_prefix_closed()
 
+    def test_default_match_reports_l3_hit_without_prefetch(self):
+        self._prepare_evicted_parent_with_child()
+
+        result = self.cache.match_prefix(
+            RadixKey(list(range(1, 9))), rid="default-sync"
+        )
+
+        self.assertEqual(result.host_hit_length, 8)
+        self.assertIsNone(self.cache._restore_backend)
+        self.assertFalse(self.cache._restore_by_path)
+        self.assertFalse(self.cache._restore_by_rid)
+
+    def test_sync_restore_is_atomic_when_later_node_fails(self):
+        parent, child = self._prepare_evicted_parent_with_child()
+        available_before_restore = self.allocator.available_size()
+        original_restore = self.cache._restore_l3_entry
+        call_count = 0
+
+        def fail_second_node(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("injected second-node failure")
+            return original_restore(*args, **kwargs)
+
+        self.cache._restore_l3_entry = fail_second_node
+        result = self.cache.match_prefix(RadixKey(list(range(1, 9))))
+
+        loaded_indices, loaded_node = self.cache.init_load_back(
+            result.last_host_node,
+            result.host_hit_length,
+            request_id="sync-failure",
+        )
+
+        self.assertEqual(len(loaded_indices), 0)
+        self.assertIs(loaded_node, self.cache.root_node)
+        self.assertTrue(parent.evicted)
+        self.assertNotIn(child, parent.children.values())
+        self.assertEqual(self.allocator.available_size(), available_before_restore)
+        self.assertEqual(self.cache.protected_size(), 0)
+        self.cache._debug_validate_invariants("unit-sync-atomic-failure")
+
+    def test_sync_restore_holds_anchor_for_entire_io(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        available_before_restore = self.allocator.available_size()
+        started, release = self._install_blocking_restore()
+        result = self.cache.match_prefix(RadixKey([1, 2, 3, 4]))
+        outcome = {}
+
+        def run_restore():
+            outcome["result"] = self.cache.init_load_back(
+                result.last_host_node,
+                result.host_hit_length,
+                request_id="sync-anchor",
+            )
+
+        restore_thread = threading.Thread(target=run_restore)
+        restore_thread.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertEqual(parent.lock_ref, 1)
+        self.assertTrue(child.evicted)
+        self.assertEqual(
+            self.allocator.available_size(), available_before_restore - 2
+        )
+
+        release.set()
+        restore_thread.join(timeout=3.0)
+        self.assertFalse(restore_thread.is_alive())
+        loaded_indices, loaded_node = outcome["result"]
+        self.assertEqual(len(loaded_indices), 2)
+        self.assertIs(loaded_node, child)
+        self.assertFalse(child.evicted)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertEqual(child.lock_ref, 0)
+        self.cache._debug_validate_invariants("unit-sync-anchor")
+
+    def test_sync_restore_slot_shortage_releases_anchor_without_publish(self):
+        parent, child = self._prepare_resident_anchor_with_evicted_child()
+        result = self.cache.match_prefix(RadixKey([1, 2, 3, 4]))
+
+        with mock.patch.object(self.allocator, "alloc", return_value=None):
+            loaded_indices, loaded_node = self.cache.init_load_back(
+                result.last_host_node,
+                result.host_hit_length,
+                request_id="sync-no-slots",
+            )
+
+        self.assertEqual(len(loaded_indices), 0)
+        self.assertIs(loaded_node, parent)
+        self.assertFalse(parent.evicted)
+        self.assertTrue(child.evicted)
+        self.assertEqual(parent.lock_ref, 0)
+        self.assertEqual(child.lock_ref, 0)
+        self.cache._debug_validate_invariants("unit-sync-no-slots")
+
     def test_async_restore_coalesces_waiters_and_commits_off_scheduler(self):
+        self._enable_async_restore_prefetch()
         parent, child = self._prepare_evicted_parent_with_child()
 
         first = self.cache.match_prefix(
@@ -640,6 +747,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self._assert_dram_residency_is_prefix_closed()
 
     def test_async_restore_holds_anchor_during_io_and_transfers_lock(self):
+        self._enable_async_restore_prefetch()
         parent, child = self._prepare_resident_anchor_with_evicted_child()
         self.cache.debug = True
         started, release = self._install_blocking_restore()
@@ -679,6 +787,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._debug_validate_invariants("unit-anchor-transfer")
 
     def test_restore_rejects_anchor_evicted_before_allocation(self):
+        self._enable_async_restore_prefetch()
         parent, child = self._prepare_resident_anchor_with_evicted_child()
         self.cache.debug = True
 
@@ -704,6 +813,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._debug_validate_invariants("unit-stale-anchor")
 
     def test_aborted_submitted_restore_releases_anchor_and_device_slots(self):
+        self._enable_async_restore_prefetch()
         parent, child = self._prepare_resident_anchor_with_evicted_child()
         self.cache.debug = True
         started, release = self._install_blocking_restore()
@@ -733,6 +843,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._debug_validate_invariants("unit-aborted-restore")
 
     def test_restore_read_failure_releases_anchor_and_device_slots(self):
+        self._enable_async_restore_prefetch()
         parent, child = self._prepare_resident_anchor_with_evicted_child()
         self.cache.debug = True
         available_before_restore = self.allocator.available_size()
@@ -754,6 +865,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._debug_validate_invariants("unit-restore-failure")
 
     def test_restore_submit_failure_releases_anchor_and_device_slots(self):
+        self._enable_async_restore_prefetch()
         parent, _child = self._prepare_resident_anchor_with_evicted_child()
         self.cache.debug = True
         available_before_restore = self.allocator.available_size()
@@ -774,6 +886,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._debug_validate_invariants("unit-restore-submit-failure")
 
     def test_reset_active_restore_releases_anchor_lock(self):
+        self._enable_async_restore_prefetch()
         parent, _child = self._prepare_resident_anchor_with_evicted_child()
         started, release = self._install_blocking_restore()
         self.cache.match_prefix(RadixKey([1, 2, 3, 4]), rid="restore")
@@ -798,7 +911,7 @@ class TestUnifiedRadixCache(unittest.TestCase):
         self.cache._stop_async_backend()
         self.cache._close_arena()
         self.allocator = FakeAllocator(size=192, chunk_size=64)
-        self.cache = self._new_cache(page_size=64)
+        self.cache = self._new_cache(page_size=64, async_restore_prefetch=True)
         self.cache.debug = True
         parent_tokens = list(range(64))
         full_tokens = list(range(128))
@@ -892,6 +1005,31 @@ class TestUnifiedRadixCache(unittest.TestCase):
             option_strings,
         )
         self.assertNotIn("--unified-radix-cache-write-backend", option_strings)
+
+    def test_async_restore_prefetch_flag_is_explicit_and_disabled_by_default(self):
+        field_names = {field.name for field in dataclasses.fields(ServerArgs)}
+        self.assertIn("unified_radix_cache_async_restore_prefetch", field_names)
+        self.assertFalse(ServerArgs.unified_radix_cache_async_restore_prefetch)
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        defaults = parser.parse_args(["--model-path", "dummy"])
+        enabled = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--unified-radix-cache-async-restore-prefetch",
+            ]
+        )
+        self.assertFalse(defaults.unified_radix_cache_async_restore_prefetch)
+        self.assertTrue(enabled.unified_radix_cache_async_restore_prefetch)
+
+        args = ServerArgs(
+            model_path="dummy",
+            unified_radix_cache_async_restore_prefetch=True,
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
+            args._handle_cache_compatibility()
 
     def test_unified_cache_rejects_multi_device_topologies(self):
         for field_name in ("tp_size", "pp_size", "dp_size"):

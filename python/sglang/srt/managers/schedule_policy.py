@@ -574,37 +574,92 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
-        total_tokens = req.extend_input_len + min(
+        max_new_tokens = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        total_tokens = req.extend_input_len + max_new_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        unified_sync_restore = (
+            getattr(self.tree_cache, "async_restore_prefetch", None) is False
+        )
+        if unified_sync_restore and req.host_hit_length > 0:
+            # The restored prefix consumes final device slots while reducing
+            # the tokens that the model must compute by the same amount.
+            total_tokens = req.host_hit_length + real_input_tokens + max_new_tokens
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
+        if (
+            unified_sync_restore
+            and req.host_hit_length > 0
+            and self.rem_chunk_tokens is not None
+            and self.rem_chunk_tokens <= 0
+        ):
+            return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
+            if (
+                unified_sync_restore
+                and req.host_hit_length > 0
+                and real_input_tokens >= self.rem_input_tokens
+                and len(self.can_run_list) != 0
+            ):
+                return AddReqResult.OTHER
+            if (
+                unified_sync_restore
+                and req.host_hit_length > 0
+                and self.rem_chunk_tokens is not None
+                and self.rem_chunk_tokens <= 0
+            ):
+                return AddReqResult.OTHER
 
             if req.host_hit_length > 0:
+                requested_host_hit_length = req.host_hit_length
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node,
                     req.host_hit_length,
                     request_id=req.rid,
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                if (
+                    unified_sync_restore
+                    and len(new_indices) != requested_host_hit_length
+                ):
+                    # Restore is an optimization. A failed atomic restore must
+                    # not be retried in this admission call or leave the
+                    # request carrying stale L3 match state.
+                    req.last_host_node = req.last_node
+                    req.host_hit_length = 0
+                else:
+                    req.prefix_indices = torch.cat(
+                        [req.prefix_indices, new_indices]
+                    )
+                    if unified_sync_restore:
+                        req.last_host_node = req.last_node
+                        req.host_hit_length = 0
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
                 req.last_matched_prefix_len = prefix_len
+
+                if (
+                    unified_sync_restore
+                    and len(new_indices) != requested_host_hit_length
+                ):
+                    fallback_total_tokens = self.ceil_paged_tokens(
+                        req.extend_input_len
+                    ) + max_new_tokens
+                    if fallback_total_tokens >= self.rem_total_tokens:
+                        return AddReqResult.NO_TOKEN
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

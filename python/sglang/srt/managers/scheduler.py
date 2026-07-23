@@ -268,6 +268,9 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_unified_radix_cache = server_args.enable_unified_radix_cache
+        self.unified_async_restore_prefetch = (
+            server_args.unified_radix_cache_async_restore_prefetch
+        )
         self.enable_cache_load_back = (
             self.enable_hierarchical_cache or self.enable_unified_radix_cache
         )
@@ -750,6 +753,9 @@ class Scheduler(
                     tp_cache_group=self.tp_cpu_group,
                     is_eagle=self.spec_algorithm.is_eagle(),
                     tp_rank=self.tp_rank,
+                    async_restore_prefetch=(
+                        server_args.unified_radix_cache_async_restore_prefetch
+                    ),
                 )
             elif os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
@@ -1367,9 +1373,9 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_unified_radix_cache:
-            # Unified L3 restore starts at admission so SSD reads and CUDA
-            # refill overlap queueing instead of blocking PrefillAdder.
+        if self.enable_unified_radix_cache and self.unified_async_restore_prefetch:
+            # Experimental Unified restore starts at queue admission so SSD
+            # reads and CUDA refill can overlap waiting time.
             req.init_next_round_input(self.tree_cache)
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
@@ -1775,14 +1781,20 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
-            if self.enable_unified_radix_cache:
+            if (
+                self.enable_unified_radix_cache
+                and self.unified_async_restore_prefetch
+            ):
                 restore_done = self.tree_cache.check_restore_progress(req.rid)
                 if not restore_done:
                     # L3 read/refill runs on its own worker and CUDA stream.
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            if self.enable_unified_radix_cache:
+            if (
+                self.enable_unified_radix_cache
+                and self.unified_async_restore_prefetch
+            ):
                 restore_pending = False
                 # A restore can complete between match_prefix() and this
                 # progress check. In that case the request still carries the

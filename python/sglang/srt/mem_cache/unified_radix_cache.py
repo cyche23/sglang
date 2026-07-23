@@ -324,7 +324,9 @@ class UnifiedRadixCache(RadixCache):
     This baseline intentionally avoids modeling CPU host memory as a separate
     cache tier. Non-chunked MHA KV insertions are written through to SSD by a
     single-worker asynchronous backend. Writes are best effort under queue
-    backpressure. Restores and partial L3 node splits remain synchronous.
+    backpressure. Restore is scheduler-synchronous by default; the old
+    match-time asynchronous prefetch is available only as an explicit
+    experimental mode. Partial L3 node splits remain synchronous.
     """
 
     def __init__(
@@ -342,6 +344,7 @@ class UnifiedRadixCache(RadixCache):
         tp_cache_group: Optional[torch.distributed.ProcessGroup] = None,
         is_eagle: bool = False,
         tp_rank: int = 0,
+        async_restore_prefetch: bool = False,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(self.kv_cache, MHATokenToKVPool):
@@ -376,6 +379,7 @@ class UnifiedRadixCache(RadixCache):
             else 1
         )
         self.max_pending_writes = max_pending_writes
+        self.async_restore_prefetch = async_restore_prefetch
         self.debug = debug
         self.profiler = JsonlProfiler(profile_path)
         self._profile_throttle: Dict[tuple, int] = {}
@@ -434,13 +438,19 @@ class UnifiedRadixCache(RadixCache):
         self._log_info(
             "UnifiedRadixCache enabled: l3_dir=%s, l3_run_dir=%s, "
             "l3_budget_bytes=%d, l3_budget_gb=%.3f, l3_block_size=%d, "
-            "write_policy=async-write-through, max_pending_writes=%d",
+            "write_policy=async-write-through, max_pending_writes=%d, "
+            "restore_mode=%s",
             self.l3_base_dir,
             self.l3_run_dir,
             self.l3_budget_bytes,
             l3_budget_gb,
             self.l3_block_size,
             self.max_pending_writes,
+            (
+                "experimental-match-prefetch"
+                if self.async_restore_prefetch
+                else "scheduler-sync"
+            ),
         )
 
         super().__init__(
@@ -519,6 +529,8 @@ class UnifiedRadixCache(RadixCache):
         )
 
     def _start_restore_backend(self):
+        if not self.async_restore_prefetch:
+            return
         if self._restore_backend is not None:
             return
         self._restore_backend = _AsyncL3RestoreBackend(
@@ -1388,7 +1400,7 @@ class UnifiedRadixCache(RadixCache):
 
         if l3_hit_length > 0:
             self.stats.hit_count += 1
-            if request_id is not None:
+            if self.async_restore_prefetch and request_id is not None:
                 self._schedule_async_restore(last_l3_node, request_id)
             self._log_info(
                 "UnifiedRadixCache L3 hit: node_id=%s, token_count=%d, "
@@ -1583,7 +1595,11 @@ class UnifiedRadixCache(RadixCache):
         request_id: Optional[str] = None,
         **kwargs,
     ):
-        if request_id is not None and request_id in self._restore_by_rid:
+        if (
+            self.async_restore_prefetch
+            and request_id is not None
+            and request_id in self._restore_by_rid
+        ):
             raise RuntimeError(
                 "UnifiedRadixCache restore is still pending; the scheduler must "
                 "wait for check_restore_progress() before staging the request."
@@ -1615,6 +1631,17 @@ class UnifiedRadixCache(RadixCache):
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 ancestor_node,
             )
+        if total_tokens != host_hit_length:
+            logger.warning(
+                "UnifiedRadixCache L3 restore path changed before admission: "
+                "expected_tokens=%d, actual_tokens=%d",
+                host_hit_length,
+                total_tokens,
+            )
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                ancestor_node,
+            )
         if mem_quota is not None and total_tokens > mem_quota:
             self._log_info(
                 "UnifiedRadixCache L3 restore skipped: token_count=%d exceeds mem_quota=%d",
@@ -1626,42 +1653,68 @@ class UnifiedRadixCache(RadixCache):
                 ancestor_node,
             )
 
-        delta = self.inc_lock_ref(ancestor_node)
-        device_indices = self.token_to_kv_pool_allocator.alloc(total_tokens)
-        if device_indices is None:
-            self.evict(total_tokens)
-            device_indices = self.token_to_kv_pool_allocator.alloc(total_tokens)
-        self.dec_lock_ref(ancestor_node)
-        if device_indices is None:
-            logger.warning(
-                "UnifiedRadixCache L3 restore failed: insufficient DRAM token slots "
-                "for token_count=%d",
-                total_tokens,
-            )
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                ancestor_node,
-            )
-
-        self.profile_event(
-            "restore_allocated",
-            rid=request_id,
-            node_id=last_host_node.id,
-            token_count=total_tokens,
-        )
-
-        _ = delta  # kept to mirror HiRadixCache load-back accounting shape
-        offset = 0
+        device_indices = None
+        restore_succeeded = False
+        failed_node = None
         restored_bytes = 0
-        restored_nodes = []
-        for l3_node in nodes_to_load:
-            token_count = len(l3_node.key)
-            dst_indices = device_indices[offset : offset + token_count]
-            entry = self._get_l3_entry(l3_node)
-            try:
+        read_latency_ms = 0.0
+        refill_latency_ms = 0.0
+        restore_nodes = []
+        self._restore_demand.set()
+        self.inc_lock_ref(ancestor_node)
+        try:
+            device_indices = self.token_to_kv_pool_allocator.alloc(total_tokens)
+            if device_indices is None:
+                self.evict(total_tokens)
+                device_indices = self.token_to_kv_pool_allocator.alloc(total_tokens)
+            if device_indices is None:
+                logger.warning(
+                    "UnifiedRadixCache L3 restore failed: insufficient DRAM token "
+                    "slots for token_count=%d",
+                    total_tokens,
+                )
+                self.profile_event(
+                    "restore_allocation_failed",
+                    rid=request_id,
+                    node_id=last_host_node.id,
+                    token_count=total_tokens,
+                )
+                return (
+                    torch.empty((0,), dtype=torch.int64, device=self.device),
+                    ancestor_node,
+                )
+
+            self.profile_event(
+                "restore_allocated",
+                rid=request_id,
+                node_id=last_host_node.id,
+                token_count=total_tokens,
+            )
+
+            offset = 0
+            parent = ancestor_node
+            for l3_node in nodes_to_load:
+                entry = self._get_l3_entry(l3_node)
+                if (
+                    not self._is_node_attached(l3_node)
+                    or l3_node.parent is not parent
+                    or not l3_node.evicted
+                    or entry is None
+                    or self._arena is None
+                    or any(not self._arena.is_current(slot) for slot in entry.slots)
+                ):
+                    failed_node = l3_node
+                    raise RuntimeError(
+                        "UnifiedRadixCache L3 restore path became stale before read"
+                    )
+                token_count = len(l3_node.key)
+                dst_indices = device_indices[offset : offset + token_count]
+                failed_node = l3_node
                 read_ms, refill_ms = self._restore_l3_entry(
                     entry, dst_indices, request_id, worker_id=0
                 )
+                read_latency_ms += read_ms
+                refill_latency_ms += refill_ms
                 self.profile_event(
                     "restore_read_complete",
                     rid=request_id,
@@ -1670,34 +1723,53 @@ class UnifiedRadixCache(RadixCache):
                     read_bytes=entry.nbytes,
                     latency_ms=read_ms,
                 )
-            except (FileNotFoundError, OSError, RuntimeError) as exc:
-                logger.warning(
-                    "UnifiedRadixCache L3 read failed; dropping stale entry and "
-                    "falling back to recompute: node_id=%s, error=%s",
-                    l3_node.id,
-                    exc,
+                self.profile_event(
+                    "restore_refill_complete",
+                    rid=request_id,
+                    node_id=l3_node.id,
+                    token_count=token_count,
+                    latency_ms=refill_ms,
                 )
-                for restored_node, restored_token_count in restored_nodes:
-                    restored_node.value = None
-                    self.evictable_size_ -= restored_token_count
-                self.token_to_kv_pool_allocator.free(device_indices)
-                self._drop_subtree(l3_node, reason="stale-l3-read-failure")
-                return (
-                    torch.empty((0,), dtype=torch.int64, device=self.device),
-                    ancestor_node,
-                )
-            self.profile_event(
-                "restore_refill_complete",
-                rid=request_id,
-                node_id=l3_node.id,
-                token_count=token_count,
-                latency_ms=refill_ms,
+                restore_nodes.append((l3_node, entry, dst_indices))
+                restored_bytes += entry.nbytes
+                offset += token_count
+                parent = l3_node
+
+            # Publishing is intentionally delayed until every read and refill
+            # has completed. Radix mutations and allocator ownership remain on
+            # the scheduler thread.
+            for l3_node, entry, dst_indices in restore_nodes:
+                l3_node.value = dst_indices
+                entry.last_access_time = time.monotonic()
+                self.evictable_size_ += len(l3_node.key)
+            restore_succeeded = True
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "UnifiedRadixCache synchronous L3 restore failed; falling back "
+                "to recompute: node_id=%s, error=%s",
+                getattr(failed_node, "id", None),
+                exc,
             )
-            l3_node.value = dst_indices
-            self.evictable_size_ += token_count
-            restored_nodes.append((l3_node, token_count))
-            restored_bytes += entry.nbytes
-            offset += token_count
+            self.profile_event(
+                "restore_failed",
+                rid=request_id,
+                node_id=getattr(failed_node, "id", None),
+                token_count=total_tokens,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            if failed_node is not None and self._is_node_attached(failed_node):
+                self._drop_subtree(failed_node, reason="stale-l3-read-failure")
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                ancestor_node,
+            )
+        finally:
+            if not restore_succeeded and device_indices is not None:
+                self.token_to_kv_pool_allocator.free(device_indices)
+            self.dec_lock_ref(ancestor_node)
+            if not self.async_restore_prefetch and not self._restore_by_path:
+                self._restore_demand.clear()
+            self._debug_validate_invariants("sync-restore")
 
         latency_ms = (time.perf_counter() - start_time) * 1000
         self.profile_event(
@@ -1706,6 +1778,8 @@ class UnifiedRadixCache(RadixCache):
             node_id=last_hit_node.id,
             token_count=total_tokens,
             read_bytes=restored_bytes,
+            read_ms=read_latency_ms,
+            refill_ms=refill_latency_ms,
             latency_ms=latency_ms,
         )
         self.stats.read_count += 1

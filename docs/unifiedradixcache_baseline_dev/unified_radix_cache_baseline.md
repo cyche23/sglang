@@ -20,8 +20,15 @@ L3 by a bounded, single-worker asynchronous backend.
   insertions skip it. The background worker performs the CPU snapshot and
   raw-file write, then the scheduler thread commits radix metadata. Successful
   writes retain the DRAM copy.
-- L3 restore and partial-node split I/O remain synchronous. There is no prefetch,
-  Mooncake, HF3FS, NIXL, or remote KV backend in this baseline.
+- L3 restore is scheduler-led and synchronous by default. Prefix matching only
+  reports an L3 hit. `PrefillAdder` first admits the request using the active
+  scheduling policy, then allocates final device slots and waits for the restore
+  before creating a dependent prefill batch.
+- The old match-time asynchronous restore prefetch path is retained only behind
+  `--unified-radix-cache-async-restore-prefetch`. The flag is disabled by
+  default and cannot be used without `--enable-unified-radix-cache`.
+- Partial-node split I/O remains synchronous. There is no Mooncake, HF3FS, NIXL,
+  or remote KV backend in this baseline.
 - Async writes are protected by radix reference locks. Insert-trigger writes may
   coexist with the current request lock and add their own tracked lock. The
   queue is bounded, and a full queue skips the write without blocking the
@@ -55,6 +62,20 @@ python3 -m sglang.launch_server \
   --unified-radix-cache-l3-block-size 4096 \
   --unified-radix-cache-max-pending-writes 8
 ```
+
+This command uses the default scheduler-synchronous restore mode. SSD pages are
+read with blocking `preadv`; H2D refill uses double-buffered CUDA streams, and
+all refill events are synchronized before restore returns. The restored radix
+path is published only after every page succeeds.
+
+To run the previous experimental match-time prefetch implementation, add:
+
+```bash
+--unified-radix-cache-async-restore-prefetch
+```
+
+The two restore modes are mutually exclusive internally. The default mode does
+not create asynchronous restore workers or request restore queues.
 
 `--unified-radix-cache-max-pending-writes` value counts queued operations and
 excludes the single active or completed operation. There is no synchronous
@@ -103,7 +124,22 @@ ratio, requested prompt length, prompt token counts returned by the server,
 cached token counts, and output non-empty checks. The server logs are the
 authoritative source for L3 byte counters and restore latency.
 
-## Async baseline limitations
+## Restore failure semantics
+
+- Restore is a cache optimization. Slot allocation, L3 read, refill, or path
+  validation failure releases every unpublished destination slot and temporary
+  lock, then retries admission using the resident GPU prefix and normal prefill
+  recomputation.
+- Slot shortage never waits inside restore. If recomputation also cannot be
+  admitted, the scheduler returns `NO_TOKEN` so the active decode batch can
+  advance and release capacity.
+- Starting synchronous restore is the admission linearization point. An abort
+  received while the scheduler is blocked in restore is processed at the next
+  scheduler point. Successfully restored KV remains ordinary shared radix
+  cache data.
+- There is no application-level timeout around blocking local SSD I/O.
+
+## Baseline limitations
 
 - The existing `MHATokenToKVPool.get_cpu_copy()` performs CUDA synchronization.
   Moving it to a worker removes scheduler-thread blocking, but it does not
